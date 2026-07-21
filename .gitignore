@@ -1,0 +1,18 @@
+# Editor / IDE
+.claude/
+.vscode/
+.idea/
+
+# OS junk
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# SE.Live composition backups (may contain private overlay URLs / stream keys)
+*.json.bak_*
+*.bak_*
+compositions/
+*.json
+
+# Archives
+*.zip
