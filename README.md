@@ -4,13 +4,15 @@ Duplicate (and rename) scenes on **SE.Live multistreaming canvases** (vertical c
 
 **v3.0** — built and tested for **SE.Live 26.9.4.994** on **OBS Studio 33.0.0** (Windows 11, October 2026).
 
+![SE.Live Scene Tool window](docs/screenshot.png)
+
 ## Compatibility
 
 | | Version |
 | --- | --- |
 | SE.Live (obs-streamelements-core) | **26.9.4.994** — tested |
 | OBS Studio | **33.0.0** (64-bit) — tested |
-| Windows | 10 / 11 |
+| Windows | 10 (version 1809 or later) / 11 |
 
 Your SE.Live version is shown in the bottom-right corner of OBS's status bar (e.g. `SE.Live 26.9.4.994`). The tool reads it too: the window footer and `-List` say whether it is the tested version.
 
@@ -71,25 +73,25 @@ The `ptr(...)` ids in the file are just memory addresses of the last session: SE
 
 ## What the tool does
 
-1. Gracefully closes OBS if it's running (it also tries a graceful close when OBS is minimized to the tray; if OBS runs as administrator it asks you to close it) and waits until SE.Live has finished saving
+1. Gracefully closes OBS if it's running and waits until SE.Live has finished saving. If OBS runs as administrator, it asks you to close OBS and carries on by itself as soon as OBS is gone.
 2. Auto-detects your composition files (or lets you browse to one — portable setups included)
-3. Four operations:
+3. Four tabs. The window stays open, so you can do several operations in a row, and OBS reopens once at the end.
    - **Duplicate** — pick a scene and type one or more new names (one per line) to make several copies at once. Same sources, positions, crops, filters. The copies go right after the original, in the order you typed them (untick the box to append them at the end instead).
    - **Rename** — for the first scene it checks the name against all of OBS and suggests one that sticks (rule 1).
    - **Delete** — removes one scene from the canvas (its sources stay in OBS). Not allowed on the active scene.
-   - **Restore backup** — pick a backup by date (it shows which scenes it contains) and put it back. The current state is backed up first, so a restore can be undone too.
+   - **Backups** — pick a backup by date (it shows which scenes it contains) and put it back. The current state is backed up first, so a restore can be undone too.
 4. Validates the result before writing — if anything looks wrong, the file is not touched:
    - all bytes outside the scene being added/removed/renamed are identical to the original,
    - a copy is identical to the original scene apart from name and ids,
    - scene and entry ids stay unique and every entry points to the right scene and canvas.
 5. Refuses to work on a file whose format it doesn't recognize (in case a future SE.Live update changes it again), and refuses to write if OBS was reopened or the file changed in the meantime
-6. Writes atomically (temp file + swap), reads the result back, and reopens OBS for you
+6. Writes atomically (temp file + swap), reads the result back, and reopens OBS when you close the window
 
 Duplicated scenes share the same underlying sources as the original (webcam, browser sources, logos...), so you only need to swap the game capture and you're done.
 
 ## Requirements
 
-- Windows 10/11
+- Windows 10 (version 1809 or later) or Windows 11
 - OBS Studio with SE.Live installed and at least one canvas created
 - PowerShell (built into Windows — nothing to install)
 
@@ -98,12 +100,13 @@ Duplicated scenes share the same underlying sources as the original (webcam, bro
 1. Download **both files** into the same folder (Desktop is fine):
    - `SELive Scene Tool.bat`
    - `SELive-Vertical-Scene-Tool.ps1`
-2. Double-click **`SELive Scene Tool.bat`**.
+2. Double-click **`SELive Scene Tool.bat`**. The tool's window opens with no console window behind it (at most a console flashes for an instant).
    - If Windows SmartScreen warns you, click *More info → Run anyway*. Both files are plain-text scripts — feel free to read the source.
+   - Tip: the link button next to the main button creates a **Desktop shortcut** with the tool's icon. It opens the tool with no console at all, not even the flash. The shortcut points to the folder the tool is in, so create it again if you move the files.
 3. If OBS is open, the tool asks permission to close it (answer any OBS confirmation dialog on screen if one appears).
-   - If OBS is set to **run as administrator** (common for game capture), Windows doesn't let a normal program close it: the tool tells you, you close OBS yourself (File → Exit) and press OK. When the tool reopens OBS, Windows asks for the usual admin confirmation.
-4. In the window: choose **Duplicate**, pick the canvas and the scene, type one or more brand-new names (one per line), click the button. (Delete, Rename and Restore backup work the same way.)
-5. OBS reopens — check the canvas dock.
+   - If OBS is set to **run as administrator** (common for game capture), Windows doesn't let a normal program close it. The tool tells you, you close OBS yourself (File → Exit), and the tool continues by itself. When the tool reopens OBS, Windows asks for the usual admin confirmation.
+4. Pick a tab (**Duplicate**, **Rename**, **Delete**, **Backups**), the canvas and the scene, then use the button bottom right. The result appears in the window, and you can carry on with other operations.
+5. Close the window: OBS reopens (if the box at the bottom is ticked). Check the canvas dock.
 
 ### Command line (optional, e.g. for Stream Deck)
 
@@ -124,7 +127,7 @@ powershell -ExecutionPolicy Bypass -File .\SELive-Vertical-Scene-Tool.ps1 -NoGui
 
 ## Backups and how to restore
 
-Every operation creates a copy like `<file>.json.bak_20261028_112035305` next to the composition file. Easiest way back: run the tool, choose **Restore backup**, pick the date. By hand: close OBS, copy the backup over the `.json` (same filename), reopen OBS.
+Every operation creates a copy like `<file>.json.bak_20261028_112035305` next to the composition file. Easiest way back: run the tool, open the **Backups** tab, pick the date. By hand: close OBS, copy the backup over the `.json` (same filename), reopen OBS.
 
 Backups are never deleted by the tool; clean up old ones yourself when the folder gets crowded.
 

@@ -5,16 +5,16 @@
   splices in (or touches) the bytes of the scene involved. Every other byte stays identical.
 
 .DESCRIPTION
-  Double-click "SELive Scene Tool.bat" (same folder) and the tool:
+  Double-click "SELive Scene Tool.bat" (same folder; it opens the window with no console) and the tool:
     1. gracefully closes OBS if it is running (so SE.Live saves fresh state)
     2. auto-detects your SE.Live "composition" files (or lets you browse to one)
-    3. lets you pick the operation (Duplicate / Rename / Delete / Restore backup), canvas, scene and new name(s)
+    3. lets you Duplicate / Rename / Delete scenes or restore a backup, as many times as you like
     4. runs with an automatic backup and deep validation (if anything looks wrong, the file is NOT touched)
-    5. restarts OBS
+    5. reopens OBS when you close the window
 
-  IMPORTANT - read the README: SE.Live keeps scene state of its own and can fight
-  external changes. Golden rules: treat the first scene as sacrificial, always
-  duplicate using brand-new names, avoid renaming scenes OBS has already seen.
+  IMPORTANT - read the README: the first scene of a canvas needs a name used nowhere else
+  in OBS (SE.Live adds " 1" otherwise; the tool checks it), and duplicates need names not
+  already used on that canvas.
 
   Command-line usage (optional, no windows):
     powershell -ExecutionPolicy Bypass -File .\SELive-Vertical-Scene-Tool.ps1 -List
@@ -55,33 +55,482 @@ $script:GuiMode      = -not ($NoGui -or $List)
 $script:ObsExe       = $null
 $script:Rng          = New-Object System.Random
 
+$script:ScriptPath    = $PSCommandPath
+$script:ToolIcon      = $null
+$script:MainWindow    = $null
+$script:BusyWindow    = $null
+$script:BusyCancelled = $false
+$script:ObsWasRunning = $false
+
 if ($script:GuiMode) {
-    Add-Type -AssemblyName System.Windows.Forms
-    Add-Type -AssemblyName System.Drawing
-    [System.Windows.Forms.Application]::EnableVisualStyles()
+    Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
+    # Own taskbar identity, so Windows shows the tool's icon instead of grouping it under PowerShell.
+    try {
+        Add-Type -Namespace SELiveSceneTool -Name Shell -MemberDefinition @'
+[DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+public static extern int SetCurrentProcessExplicitAppUserModelID(string appId);
+'@
+        [void][SELiveSceneTool.Shell]::SetCurrentProcessExplicitAppUserModelID('SELive.SceneTool')
+    } catch { }
+}
+
+# ------------------------------------------------------------------ #
+#  0. Look & feel (WPF, dark theme in the style of the SE.Live dock) #
+# ------------------------------------------------------------------ #
+# Kept ASCII-only on purpose: Windows PowerShell 5.1 reads a BOM-less script as ANSI, so every
+# non-ASCII glyph below is written as a XAML character reference (&#x....;) or built with [char].
+$script:XamlResources = @'
+<SolidColorBrush x:Key="Bg" Color="#14161F"/>
+<SolidColorBrush x:Key="Surface" Color="#1C1F2C"/>
+<SolidColorBrush x:Key="Surface2" Color="#252A3B"/>
+<SolidColorBrush x:Key="Line" Color="#2F3549"/>
+<SolidColorBrush x:Key="Sel" Color="#2B3760"/>
+<SolidColorBrush x:Key="Fg" Color="#E9EBF3"/>
+<SolidColorBrush x:Key="Muted" Color="#8F96AD"/>
+<SolidColorBrush x:Key="Accent" Color="#4F6EF7"/>
+<SolidColorBrush x:Key="Danger" Color="#E5484D"/>
+
+<Style x:Key="BtnBase" TargetType="Button">
+  <Setter Property="Foreground" Value="White"/>
+  <Setter Property="FontWeight" Value="SemiBold"/>
+  <Setter Property="Padding" Value="18,9"/>
+  <Setter Property="BorderThickness" Value="0"/>
+  <Setter Property="Cursor" Value="Hand"/>
+  <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+  <Setter Property="Template">
+    <Setter.Value>
+      <ControlTemplate TargetType="Button">
+        <Border x:Name="bd" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
+                BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="8" Padding="{TemplateBinding Padding}">
+          <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+        </Border>
+        <ControlTemplate.Triggers>
+          <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Opacity" Value="0.86"/></Trigger>
+          <Trigger Property="IsPressed" Value="True"><Setter TargetName="bd" Property="Opacity" Value="0.7"/></Trigger>
+          <Trigger Property="IsEnabled" Value="False"><Setter TargetName="bd" Property="Opacity" Value="0.38"/></Trigger>
+        </ControlTemplate.Triggers>
+      </ControlTemplate>
+    </Setter.Value>
+  </Setter>
+</Style>
+<Style x:Key="Primary" TargetType="Button" BasedOn="{StaticResource BtnBase}">
+  <Setter Property="Background" Value="{StaticResource Accent}"/>
+</Style>
+<Style x:Key="DangerBtn" TargetType="Button" BasedOn="{StaticResource BtnBase}">
+  <Setter Property="Background" Value="{StaticResource Danger}"/>
+</Style>
+<Style x:Key="Ghost" TargetType="Button" BasedOn="{StaticResource BtnBase}">
+  <Setter Property="Background" Value="{StaticResource Surface}"/>
+  <Setter Property="BorderBrush" Value="{StaticResource Line}"/>
+  <Setter Property="BorderThickness" Value="1"/>
+  <Setter Property="Foreground" Value="{StaticResource Fg}"/>
+  <Setter Property="FontWeight" Value="Normal"/>
+</Style>
+<Style x:Key="Chrome" TargetType="Button">
+  <Setter Property="Foreground" Value="{StaticResource Muted}"/>
+  <Setter Property="FontFamily" Value="Segoe MDL2 Assets"/>
+  <Setter Property="FontSize" Value="10"/>
+  <Setter Property="Cursor" Value="Hand"/>
+  <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+  <Setter Property="Template">
+    <Setter.Value>
+      <ControlTemplate TargetType="Button">
+        <Border x:Name="bd" Background="Transparent" CornerRadius="6" Width="34" Height="28">
+          <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+        </Border>
+        <ControlTemplate.Triggers>
+          <Trigger Property="IsMouseOver" Value="True">
+            <Setter TargetName="bd" Property="Background" Value="{StaticResource Surface2}"/>
+            <Setter Property="Foreground" Value="{StaticResource Fg}"/>
+          </Trigger>
+          <MultiTrigger>
+            <MultiTrigger.Conditions>
+              <Condition Property="IsMouseOver" Value="True"/>
+              <Condition Property="Tag" Value="close"/>
+            </MultiTrigger.Conditions>
+            <Setter TargetName="bd" Property="Background" Value="{StaticResource Danger}"/>
+            <Setter Property="Foreground" Value="White"/>
+          </MultiTrigger>
+        </ControlTemplate.Triggers>
+      </ControlTemplate>
+    </Setter.Value>
+  </Setter>
+</Style>
+<Style x:Key="Tab" TargetType="RadioButton">
+  <Setter Property="Foreground" Value="{StaticResource Muted}"/>
+  <Setter Property="Cursor" Value="Hand"/>
+  <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+  <Setter Property="Template">
+    <Setter.Value>
+      <ControlTemplate TargetType="RadioButton">
+        <Border x:Name="bd" Background="Transparent" CornerRadius="7" Padding="6,8">
+          <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
+            <TextBlock Text="{TemplateBinding Tag}" FontFamily="Segoe MDL2 Assets" FontSize="13" VerticalAlignment="Center" Margin="0,0,8,0"/>
+            <ContentPresenter VerticalAlignment="Center"/>
+          </StackPanel>
+        </Border>
+        <ControlTemplate.Triggers>
+          <Trigger Property="IsMouseOver" Value="True">
+            <Setter TargetName="bd" Property="Background" Value="{StaticResource Surface2}"/>
+            <Setter Property="Foreground" Value="{StaticResource Fg}"/>
+          </Trigger>
+          <Trigger Property="IsChecked" Value="True">
+            <Setter TargetName="bd" Property="Background" Value="{StaticResource Accent}"/>
+            <Setter Property="Foreground" Value="White"/>
+          </Trigger>
+        </ControlTemplate.Triggers>
+      </ControlTemplate>
+    </Setter.Value>
+  </Setter>
+</Style>
+<Style TargetType="CheckBox">
+  <Setter Property="Foreground" Value="{StaticResource Fg}"/>
+  <Setter Property="Cursor" Value="Hand"/>
+  <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+  <Setter Property="Template">
+    <Setter.Value>
+      <ControlTemplate TargetType="CheckBox">
+        <StackPanel Orientation="Horizontal" Background="Transparent">
+          <Border x:Name="box" Width="18" Height="18" CornerRadius="5" BorderThickness="1.5" BorderBrush="#4A5170"
+                  Background="{StaticResource Surface}" VerticalAlignment="Center">
+            <Path x:Name="tick" Data="M 3.5,8.5 L 6.8,11.8 L 12.8,5" Stroke="White" StrokeThickness="2" Visibility="Collapsed"
+                  StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round"/>
+          </Border>
+          <ContentPresenter Margin="9,0,0,0" VerticalAlignment="Center"/>
+        </StackPanel>
+        <ControlTemplate.Triggers>
+          <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="box" Property="BorderBrush" Value="{StaticResource Accent}"/></Trigger>
+          <Trigger Property="IsChecked" Value="True">
+            <Setter TargetName="box" Property="Background" Value="{StaticResource Accent}"/>
+            <Setter TargetName="box" Property="BorderBrush" Value="{StaticResource Accent}"/>
+            <Setter TargetName="tick" Property="Visibility" Value="Visible"/>
+          </Trigger>
+        </ControlTemplate.Triggers>
+      </ControlTemplate>
+    </Setter.Value>
+  </Setter>
+</Style>
+<Style TargetType="TextBox">
+  <Setter Property="Foreground" Value="{StaticResource Fg}"/>
+  <Setter Property="CaretBrush" Value="{StaticResource Fg}"/>
+  <Setter Property="SelectionBrush" Value="{StaticResource Accent}"/>
+  <Setter Property="FontSize" Value="13"/>
+  <Setter Property="Template">
+    <Setter.Value>
+      <ControlTemplate TargetType="TextBox">
+        <Border x:Name="bd" Background="{StaticResource Surface}" BorderBrush="{StaticResource Line}" BorderThickness="1"
+                CornerRadius="8" Padding="8,7">
+          <ScrollViewer x:Name="PART_ContentHost" VerticalScrollBarVisibility="Auto"/>
+        </Border>
+        <ControlTemplate.Triggers>
+          <Trigger Property="IsKeyboardFocused" Value="True"><Setter TargetName="bd" Property="BorderBrush" Value="{StaticResource Accent}"/></Trigger>
+        </ControlTemplate.Triggers>
+      </ControlTemplate>
+    </Setter.Value>
+  </Setter>
+</Style>
+<Style TargetType="ScrollBar">
+  <Setter Property="Width" Value="8"/>
+  <Setter Property="MinWidth" Value="8"/>
+  <Setter Property="Template">
+    <Setter.Value>
+      <ControlTemplate TargetType="ScrollBar">
+        <Track x:Name="PART_Track" IsDirectionReversed="True" Orientation="{TemplateBinding Orientation}">
+          <Track.Thumb>
+            <Thumb>
+              <Thumb.Template>
+                <ControlTemplate TargetType="Thumb"><Border Background="#3A4058" CornerRadius="3" Margin="2"/></ControlTemplate>
+              </Thumb.Template>
+            </Thumb>
+          </Track.Thumb>
+        </Track>
+      </ControlTemplate>
+    </Setter.Value>
+  </Setter>
+</Style>
+<Style TargetType="ComboBoxItem">
+  <Setter Property="Foreground" Value="{StaticResource Fg}"/>
+  <Setter Property="Cursor" Value="Hand"/>
+  <Setter Property="Template">
+    <Setter.Value>
+      <ControlTemplate TargetType="ComboBoxItem">
+        <Border x:Name="bd" Background="Transparent" CornerRadius="6" Padding="10,7"><ContentPresenter/></Border>
+        <ControlTemplate.Triggers>
+          <Trigger Property="IsHighlighted" Value="True"><Setter TargetName="bd" Property="Background" Value="{StaticResource Surface2}"/></Trigger>
+          <Trigger Property="IsSelected" Value="True"><Setter TargetName="bd" Property="Background" Value="{StaticResource Sel}"/></Trigger>
+        </ControlTemplate.Triggers>
+      </ControlTemplate>
+    </Setter.Value>
+  </Setter>
+</Style>
+<Style TargetType="ComboBox">
+  <Setter Property="Foreground" Value="{StaticResource Fg}"/>
+  <Setter Property="Height" Value="38"/>
+  <Setter Property="Cursor" Value="Hand"/>
+  <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+  <Setter Property="Template">
+    <Setter.Value>
+      <ControlTemplate TargetType="ComboBox">
+        <Grid>
+          <ToggleButton Focusable="False" ClickMode="Press"
+                        IsChecked="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}">
+            <ToggleButton.Template>
+              <ControlTemplate TargetType="ToggleButton">
+                <Border x:Name="b" Background="{StaticResource Surface}" BorderBrush="{StaticResource Line}" BorderThickness="1" CornerRadius="8">
+                  <TextBlock Text="&#xE70D;" FontFamily="Segoe MDL2 Assets" FontSize="10" Foreground="{StaticResource Muted}"
+                             HorizontalAlignment="Right" VerticalAlignment="Center" Margin="0,0,13,0"/>
+                </Border>
+                <ControlTemplate.Triggers>
+                  <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="b" Property="BorderBrush" Value="{StaticResource Accent}"/></Trigger>
+                </ControlTemplate.Triggers>
+              </ControlTemplate>
+            </ToggleButton.Template>
+          </ToggleButton>
+          <ContentPresenter IsHitTestVisible="False" Content="{TemplateBinding SelectionBoxItem}" Margin="13,0,34,0" VerticalAlignment="Center"/>
+          <Popup IsOpen="{TemplateBinding IsDropDownOpen}" Placement="Bottom" AllowsTransparency="True" Focusable="False" PopupAnimation="Fade">
+            <Border Background="{StaticResource Surface}" BorderBrush="{StaticResource Line}" BorderThickness="1" CornerRadius="8"
+                    Margin="0,4,0,0" Padding="4" MinWidth="{Binding ActualWidth, RelativeSource={RelativeSource TemplatedParent}}">
+              <ScrollViewer MaxHeight="240"><ItemsPresenter/></ScrollViewer>
+            </Border>
+          </Popup>
+        </Grid>
+      </ControlTemplate>
+    </Setter.Value>
+  </Setter>
+</Style>
+<Style TargetType="ListBox">
+  <Setter Property="Background" Value="{StaticResource Surface}"/>
+  <Setter Property="BorderBrush" Value="{StaticResource Line}"/>
+  <Setter Property="Foreground" Value="{StaticResource Fg}"/>
+  <Setter Property="Template">
+    <Setter.Value>
+      <ControlTemplate TargetType="ListBox">
+        <Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="1" CornerRadius="10" Padding="5">
+          <ScrollViewer Focusable="False" HorizontalScrollBarVisibility="Disabled" VerticalScrollBarVisibility="Auto"><ItemsPresenter/></ScrollViewer>
+        </Border>
+      </ControlTemplate>
+    </Setter.Value>
+  </Setter>
+</Style>
+<Style TargetType="ListBoxItem">
+  <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+  <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+  <Setter Property="Cursor" Value="Hand"/>
+  <Setter Property="Template">
+    <Setter.Value>
+      <ControlTemplate TargetType="ListBoxItem">
+        <Border x:Name="bd" Background="Transparent" CornerRadius="7" Padding="11,8" Margin="0,1">
+          <ContentPresenter/>
+        </Border>
+        <ControlTemplate.Triggers>
+          <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Background" Value="{StaticResource Surface2}"/></Trigger>
+          <Trigger Property="IsSelected" Value="True"><Setter TargetName="bd" Property="Background" Value="{StaticResource Sel}"/></Trigger>
+        </ControlTemplate.Triggers>
+      </ControlTemplate>
+    </Setter.Value>
+  </Setter>
+</Style>
+<Style x:Key="Caption" TargetType="TextBlock">
+  <Setter Property="Foreground" Value="{StaticResource Muted}"/>
+  <Setter Property="FontSize" Value="11"/>
+  <Setter Property="FontWeight" Value="SemiBold"/>
+  <Setter Property="Margin" Value="2,16,0,7"/>
+</Style>
+'@
+
+# Window shell shared by every window: borderless, rounded, with a soft shadow and a draggable title bar.
+$script:XamlShell = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="SE.Live Scene Tool" Width="{{WIDTH}}" SizeToContent="Height" WindowStyle="None" AllowsTransparency="True"
+        Background="Transparent" ResizeMode="NoResize" FontFamily="Segoe UI" FontSize="13" Foreground="#E9EBF3"
+        UseLayoutRounding="True" TextOptions.TextFormattingMode="Display">
+  <Window.Resources>{{RES}}</Window.Resources>
+  <Border Margin="16" Background="{StaticResource Bg}" BorderBrush="#262B3D" BorderThickness="1" CornerRadius="14">
+    <Border.Effect><DropShadowEffect BlurRadius="24" ShadowDepth="4" Opacity="0.55" Color="Black"/></Border.Effect>
+    <Grid>
+      <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+      <Grid x:Name="TitleBar" Background="Transparent" Height="46">
+        <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="16,0,0,0">
+          <Border Width="22" Height="22" CornerRadius="6" Background="{StaticResource Accent}">
+            <TextBlock Text="&#xE8C8;" FontFamily="Segoe MDL2 Assets" FontSize="11" Foreground="White" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+          </Border>
+          <TextBlock Text="{{TITLE}}" FontWeight="SemiBold" Margin="10,0,0,0" VerticalAlignment="Center"/>
+        </StackPanel>
+        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center" Margin="0,0,9,0">
+          <Button x:Name="btnMin" Style="{StaticResource Chrome}" Content="&#xE921;" Visibility="{{MINVIS}}" ToolTip="Minimize"/>
+          <Button x:Name="btnClose" Style="{StaticResource Chrome}" Content="&#xE8BB;" Tag="close" ToolTip="Close" Margin="2,0,0,0"/>
+        </StackPanel>
+      </Grid>
+      <ContentControl Grid.Row="1">{{BODY}}</ContentControl>
+    </Grid>
+  </Border>
+</Window>
+'@
+
+function New-ToolWindow([string]$Title, [string]$Body, [int]$Width, [bool]$Minimizable) {
+    $minVis = if ($Minimizable) { 'Visible' } else { 'Collapsed' }
+    $xaml = $script:XamlShell.Replace('{{RES}}', $script:XamlResources).Replace('{{BODY}}', $Body).
+        Replace('{{TITLE}}', $Title).Replace('{{WIDTH}}', [string]($Width + 32)).Replace('{{MINVIS}}', $minVis)
+    $w = [Windows.Markup.XamlReader]::Parse($xaml)
+    $w.FindName('TitleBar').Add_MouseLeftButtonDown({ try { [System.Windows.Window]::GetWindow($this).DragMove() } catch { } })
+    $w.FindName('btnMin').Add_Click({ [System.Windows.Window]::GetWindow($this).WindowState = 'Minimized' })
+    $w.FindName('btnClose').Add_Click({ [System.Windows.Window]::GetWindow($this).Close() })
+    $w.Add_KeyDown({ if ($_.Key -eq 'Escape') { $this.Close() } })
+    $icon = Get-ToolIcon
+    if ($icon) { $w.Icon = $icon }
+    return $w
+}
+
+# The app icon (accent square with a "copy" glyph), drawn once and reused for windows and the Desktop shortcut.
+function Get-ToolIcon {
+    if ($script:ToolIcon) { return $script:ToolIcon }
+    try {
+        $size = 256
+        $dv = New-Object System.Windows.Media.DrawingVisual
+        $dc = $dv.RenderOpen()
+        $grad = New-Object System.Windows.Media.LinearGradientBrush(
+            [System.Windows.Media.Color]::FromRgb(0x6A, 0x86, 0xFF), [System.Windows.Media.Color]::FromRgb(0x3F, 0x5B, 0xE6), 90.0)
+        $dc.DrawRoundedRectangle($grad, $null, (New-Object System.Windows.Rect(8, 8, 240, 240)), 56, 56)
+        $tf = New-Object System.Windows.Media.Typeface('Segoe MDL2 Assets')
+        $ft = New-Object System.Windows.Media.FormattedText([string][char]0xE8C8, [Globalization.CultureInfo]::InvariantCulture,
+            [System.Windows.FlowDirection]::LeftToRight, $tf, 128.0, [System.Windows.Media.Brushes]::White, 1.0)
+        $dc.DrawText($ft, (New-Object System.Windows.Point((($size - $ft.Width) / 2), (($size - $ft.Height) / 2))))
+        $dc.Close()
+        $bmp = New-Object System.Windows.Media.Imaging.RenderTargetBitmap($size, $size, 96, 96, [System.Windows.Media.PixelFormats]::Pbgra32)
+        $bmp.Render($dv)
+        $bmp.Freeze()
+        $script:ToolIcon = $bmp
+    } catch { $script:ToolIcon = $null }
+    return $script:ToolIcon
+}
+
+$script:Kinds = @{
+    info     = @{ Color = '#4F6EF7'; Glyph = 0xE946; Title = 'SE.Live Scene Tool' }
+    question = @{ Color = '#4F6EF7'; Glyph = 0xE9CE; Title = 'Please confirm' }
+    warn     = @{ Color = '#F2A93B'; Glyph = 0xE7BA; Title = 'Heads up' }
+    error    = @{ Color = '#E5484D'; Glyph = 0xEA39; Title = 'Something went wrong' }
+    ok       = @{ Color = '#2FBF84'; Glyph = 0xE73E; Title = 'Done' }
+}
+
+function New-Brush([string]$Hex, [byte]$Alpha = 255) {
+    $c = [System.Windows.Media.ColorConverter]::ConvertFromString($Hex)
+    return New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromArgb($Alpha, $c.R, $c.G, $c.B))
+}
+
+# A dark message box. $Buttons[0] is the main action (red when $Danger), the others are secondary.
+# Returns the label of the button that was clicked ('' if the window was closed).
+function Show-Dialog([string]$Message, [string]$Kind = 'info', [string[]]$Buttons = @('OK'), [string]$Title, [switch]$Danger) {
+    $k = $script:Kinds[$Kind]
+    if (-not $Title) { $Title = $k.Title }
+    $body = @'
+<StackPanel Margin="24,2,24,22">
+  <Grid>
+    <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+    <Border x:Name="iconBg" Width="38" Height="38" CornerRadius="19" VerticalAlignment="Top">
+      <TextBlock x:Name="icon" FontFamily="Segoe MDL2 Assets" FontSize="17" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+    </Border>
+    <StackPanel Grid.Column="1" Margin="14,0,0,0">
+      <TextBlock x:Name="title" FontSize="16" FontWeight="SemiBold" TextWrapping="Wrap" Margin="0,1,0,6"/>
+      <TextBlock x:Name="msg" TextWrapping="Wrap" Foreground="#B8BDCE" LineHeight="20"/>
+    </StackPanel>
+  </Grid>
+  <StackPanel x:Name="buttons" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,22,0,0"/>
+</StackPanel>
+'@
+    $w = New-ToolWindow 'SE.Live Scene Tool' $body 440 $false
+    $w.FindName('iconBg').Background = New-Brush $k.Color 0x2A
+    $w.FindName('icon').Foreground   = New-Brush $k.Color
+    $w.FindName('icon').Text         = [string][char]$k.Glyph
+    $w.FindName('title').Text        = $Title
+    $w.FindName('msg').Text          = $Message
+    $panel = $w.FindName('buttons')
+    for ($i = $Buttons.Count - 1; $i -ge 1; $i--) {
+        $b = New-Object System.Windows.Controls.Button
+        $b.Content = $Buttons[$i]; $b.Style = $w.FindResource('Ghost'); $b.IsCancel = $true
+        $b.Margin = New-Object System.Windows.Thickness(0, 0, 8, 0)
+        $b.Add_Click({ $win = [System.Windows.Window]::GetWindow($this); $win.Tag = [string]$this.Content; $win.Close() })
+        [void]$panel.Children.Add($b)
+    }
+    $main = New-Object System.Windows.Controls.Button
+    $main.Content = $Buttons[0]; $main.IsDefault = $true
+    $main.Style = if ($Danger) { $w.FindResource('DangerBtn') } else { $w.FindResource('Primary') }
+    $main.Add_Click({ $win = [System.Windows.Window]::GetWindow($this); $win.Tag = [string]$this.Content; $win.Close() })
+    [void]$panel.Children.Add($main)
+    if ($script:MainWindow -and $script:MainWindow.IsVisible) {
+        $w.Owner = $script:MainWindow; $w.WindowStartupLocation = 'CenterOwner'
+    } else {
+        $w.WindowStartupLocation = 'CenterScreen'; $w.Topmost = $true
+    }
+    $w.Add_ContentRendered({ $this.Activate() })
+    [void]$w.ShowDialog()
+    return [string]$w.Tag
+}
+
+# Small non-modal "please wait" window, kept responsive by Wait-Ms while the tool waits for OBS.
+function Show-Busy([string]$Text) {
+    if (-not $script:GuiMode) { return }
+    if (-not $script:BusyWindow) {
+        $body = @'
+<StackPanel Margin="24,4,24,22">
+  <TextBlock x:Name="text" TextWrapping="Wrap" LineHeight="20" Foreground="#B8BDCE"/>
+  <ProgressBar IsIndeterminate="True" Height="4" Margin="0,16,0,0" Foreground="#4F6EF7" Background="#252A3B" BorderThickness="0"/>
+  <Button x:Name="cancel" Content="Cancel" Style="{StaticResource Ghost}" HorizontalAlignment="Right" Margin="0,18,0,0"/>
+</StackPanel>
+'@
+        $script:BusyWindow = New-ToolWindow 'SE.Live Scene Tool' $body 420 $true
+        $script:BusyWindow.WindowStartupLocation = 'CenterScreen'
+        $script:BusyWindow.FindName('cancel').Add_Click({ $script:BusyCancelled = $true })
+        $script:BusyWindow.Add_Closed({ $script:BusyCancelled = $true })
+        $script:BusyWindow.Show()
+        $script:BusyWindow.Activate()
+    }
+    $script:BusyWindow.FindName('text').Text = $Text
+    Wait-Ms 60
+}
+
+function Hide-Busy {
+    if ($script:BusyWindow) {
+        $w = $script:BusyWindow; $script:BusyWindow = $null
+        $w.Close()
+        $script:BusyCancelled = $false
+    }
+}
+
+# Sleep that keeps the windows responsive (painting, clicks on Cancel) while the tool waits.
+function Wait-Ms([int]$Ms) {
+    if (-not $script:GuiMode) { Start-Sleep -Milliseconds $Ms; return }
+    $end = (Get-Date).AddMilliseconds($Ms)
+    do {
+        [System.Windows.Threading.Dispatcher]::CurrentDispatcher.Invoke([Action]{ }, [System.Windows.Threading.DispatcherPriority]::Background)
+        Start-Sleep -Milliseconds 25
+        if ($script:BusyCancelled) { Hide-Busy; exit 0 }
+    } while ((Get-Date) -lt $end)
 }
 
 function Show-ErrorBox([string]$Msg) {
-    if ($script:GuiMode) {
-        [System.Windows.Forms.MessageBox]::Show($Msg, 'SE.Live Scene Tool',
-            [System.Windows.Forms.MessageBoxButtons]::OK,
-            [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
-    } else { Write-Host "ERROR: $Msg" -ForegroundColor Red }
+    if ($script:GuiMode) { [void](Show-Dialog $Msg 'error') }
+    else { Write-Host "ERROR: $Msg" -ForegroundColor Red }
 }
 
 function Show-InfoBox([string]$Msg) {
-    if ($script:GuiMode) {
-        [System.Windows.Forms.MessageBox]::Show($Msg, 'SE.Live Scene Tool',
-            [System.Windows.Forms.MessageBoxButtons]::OK,
-            [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
-    } else { Write-Host $Msg -ForegroundColor Green }
+    if ($script:GuiMode) { [void](Show-Dialog $Msg 'ok') }
+    else { Write-Host $Msg -ForegroundColor Green }
 }
 
-function Confirm-Box([string]$Msg) {
-    $r = [System.Windows.Forms.MessageBox]::Show($Msg, 'SE.Live Scene Tool',
-        [System.Windows.Forms.MessageBoxButtons]::YesNo,
-        [System.Windows.Forms.MessageBoxIcon]::Question)
-    return ($r -eq [System.Windows.Forms.DialogResult]::Yes)
+function Confirm-Box([string]$Msg, [string]$Yes = 'Yes', [string]$No = 'Cancel') {
+    return ((Show-Dialog $Msg 'question' @($Yes, $No)) -eq $Yes)
+}
+
+# Started from the launcher there is no console, so nothing may fail silently: any error that is not
+# handled elsewhere ends up in a dialog.
+trap {
+    $text = $_.Exception.Message
+    if ($script:GuiMode) {
+        Hide-Busy
+        try { [void](Show-Dialog "$text`n`n(at line $($_.InvocationInfo.ScriptLineNumber))" 'error') } catch { }
+    } else { Write-Host "ERROR: $text" -ForegroundColor Red }
+    exit 1
 }
 
 # ------------------------------------------------------------------ #
@@ -92,7 +541,7 @@ function Get-ObsProcess { return @(Get-Process -Name obs64, obs32 -ErrorAction S
 function Wait-ObsExit([int]$Seconds) {
     $limite = (Get-Date).AddSeconds($Seconds)
     while ((Get-ObsProcess).Count -gt 0 -and (Get-Date) -lt $limite) {
-        Start-Sleep -Milliseconds 500
+        Wait-Ms 400
     }
     return ((Get-ObsProcess).Count -eq 0)
 }
@@ -104,6 +553,7 @@ function Close-Obs {
     # process from closing an elevated one: in that case only the user can close it.
     $elevated = @($procs | Where-Object { -not $_.Path }).Count -gt 0
     if (-not $elevated) {
+        Show-Busy "Closing OBS...`nIf OBS asks for a confirmation, answer it there."
         foreach ($p in $procs) {
             if (-not $p.CloseMainWindow()) {
                 # Main window hidden (minimized to tray): a plain taskkill still asks it to close gracefully.
@@ -115,27 +565,21 @@ function Close-Obs {
     if ($elevated) { $why = "OBS is running as administrator, so Windows does not let this tool close it." }
     else           { $why = "OBS did not close within 45 seconds (maybe a confirmation dialog is open)." }
     if (-not $script:GuiMode) { throw "$why Close OBS yourself (File > Exit) and run the tool again." }
-    while ($true) {
-        $r = [System.Windows.Forms.MessageBox]::Show(
-            "$why`n`nClose OBS yourself (File > Exit), then press OK.",
-            'SE.Live Scene Tool',
-            [System.Windows.Forms.MessageBoxButtons]::OKCancel,
-            [System.Windows.Forms.MessageBoxIcon]::Information)
-        if ($r -ne [System.Windows.Forms.DialogResult]::OK) { exit 0 }
-        if (Wait-ObsExit 15) { return }
-    }
+    Show-Busy "$why`n`nClose OBS yourself (File > Exit): the tool continues by itself as soon as OBS is gone."
+    while (-not (Wait-ObsExit 3600)) { }
 }
 
 function Wait-FilesSettled([string]$Dir) {
     # SE.Live writes its compositions while OBS shuts down: wait until nothing in the folder changes anymore.
-    Start-Sleep -Seconds 1
+    Show-Busy "Waiting for SE.Live to finish saving..."
+    Wait-Ms 1000
     $prev = $null
     for ($k = 0; $k -lt 20; $k++) {
         $sig = (Get-ChildItem -LiteralPath $Dir -Filter '*.json' -File -ErrorAction SilentlyContinue |
                 ForEach-Object { "$($_.Name)|$($_.Length)|$($_.LastWriteTimeUtc.Ticks)" }) -join ';'
         if ($sig -eq $prev) { return }
         $prev = $sig
-        Start-Sleep -Milliseconds 750
+        Wait-Ms 750
     }
 }
 
@@ -202,6 +646,9 @@ function Write-Composition([string]$Path, [string]$Text, [bool]$HasBom) {
     [System.IO.File]::Replace($tmp, $Path, [NullString]::Value)
 }
 
+# PowerShell unrolls a one-scene result into a single object, which in Windows PowerShell 5.1 has no
+# .Count: callers that count or index the list must wrap the call in @( ) (a one-scene canvas was
+# otherwise reported as "scene not found").
 function Get-SceneList($Parsed) { return @(@($Parsed.scenes) | Where-Object { $null -ne $_ }) }
 
 function Test-CompositionFormat($Parsed) {
@@ -375,7 +822,7 @@ function Update-Span([string]$Text, $Span, [string]$New) {
 }
 
 function Find-SceneIndex($Parsed, [string]$SceneName) {
-    $scenes = Get-SceneList $Parsed
+    $scenes = @(Get-SceneList $Parsed)
     $idx = -1
     for ($k = 0; $k -lt $scenes.Count; $k++) {
         if ($scenes[$k].name -ceq $SceneName) {
@@ -459,7 +906,7 @@ function ConvertTo-Canonical($Value) { return (ConvertTo-Json -InputObject $Valu
 # Without -AfterScene the copy is appended at the end of the list, otherwise it goes right after that scene.
 function Copy-SceneInText([string]$Text, [string]$SceneName, [string]$TargetName, [string]$AfterScene) {
     $parsed = ConvertFrom-Json -InputObject $Text
-    $scenes = Get-SceneList $parsed
+    $scenes = @(Get-SceneList $parsed)
     $idx    = Find-SceneIndex $parsed $SceneName
     Assert-ValidNewName $parsed $TargetName $null
     $before = Get-IntegrityProblems $parsed
@@ -506,7 +953,7 @@ function Copy-SceneInText([string]$Text, [string]$SceneName, [string]$TargetName
         throw "Validation failed (bytes outside the new scene changed): operation aborted, file untouched."
     }
     $check     = ConvertFrom-Json -InputObject $newText
-    $newScenes = Get-SceneList $check
+    $newScenes = @(Get-SceneList $check)
     if ($newScenes.Count -ne ($scenes.Count + 1)) { throw "Validation failed (scene count): operation aborted, file untouched." }
     $copy = $newScenes[$copyIdx]
     if ($copy.name -cne $TargetName -or $copy.active -ne $false) { throw "Validation failed (name/active of the copy): operation aborted, file untouched." }
@@ -522,7 +969,7 @@ function Copy-SceneInText([string]$Text, [string]$SceneName, [string]$TargetName
 
 function Rename-SceneInText([string]$Text, [string]$SceneName, [string]$TargetName) {
     $parsed = ConvertFrom-Json -InputObject $Text
-    $scenes = Get-SceneList $parsed
+    $scenes = @(Get-SceneList $parsed)
     $idx    = Find-SceneIndex $parsed $SceneName
     if ($TargetName -ceq $SceneName) { throw "The new name is identical to the current one." }
     Assert-ValidNewName $parsed $TargetName $SceneName
@@ -537,7 +984,7 @@ function Rename-SceneInText([string]$Text, [string]$SceneName, [string]$TargetNa
     $newText  = $Text.Remove($absStart, $absLen).Insert($absStart, '"' + (ConvertTo-JsonEscaped $TargetName) + '"')
 
     $check     = ConvertFrom-Json -InputObject $newText
-    $newScenes = Get-SceneList $check
+    $newScenes = @(Get-SceneList $check)
     if ($newScenes.Count -ne $scenes.Count -or $newScenes[$idx].name -cne $TargetName -or $newScenes[$idx].id -ne $scenes[$idx].id) {
         throw "Validation failed: operation aborted, file untouched."
     }
@@ -547,7 +994,7 @@ function Rename-SceneInText([string]$Text, [string]$SceneName, [string]$TargetNa
 
 function Remove-SceneInText([string]$Text, [string]$SceneName) {
     $parsed = ConvertFrom-Json -InputObject $Text
-    $scenes = Get-SceneList $parsed
+    $scenes = @(Get-SceneList $parsed)
     $idx    = Find-SceneIndex $parsed $SceneName
     if ($scenes.Count -le 1) { throw "'$SceneName' is the only scene of this canvas: it cannot be deleted." }
     if ($scenes[$idx].active) { throw "'$SceneName' is the active scene of the canvas. Switch the canvas to another scene in OBS first, then delete it." }
@@ -798,11 +1245,14 @@ if (-not $List -and (Get-ObsProcess).Count -gt 0) {
         Show-ErrorBox "OBS is running. Close it first, or add -Force to let the tool close it gracefully."
         exit 1
     }
-    if ($script:GuiMode -and -not (Confirm-Box "OBS is running and needs to be closed, because SE.Live saves its canvas scenes when OBS shuts down.`n`nClose OBS gracefully now and reopen it when done?`n`n(If OBS shows a confirmation dialog on screen, answer it there.)")) {
+    if ($script:GuiMode -and -not (Confirm-Box ("OBS needs to be closed: SE.Live saves the canvas scenes when OBS shuts down, " +
+            "and would overwrite any change made while it runs.`n`nThe tool can reopen OBS when you are done.") 'Close OBS' 'Cancel')) {
         exit 0
     }
-    try { Close-Obs } catch { Show-ErrorBox $_.Exception.Message; exit 1 }
+    $script:ObsWasRunning = $true
+    try { Close-Obs } catch { Hide-Busy; Show-ErrorBox $_.Exception.Message; exit 1 }
     Wait-FilesSettled $compDir
+    Hide-Busy
 }
 
 if ($File) {
@@ -810,11 +1260,11 @@ if ($File) {
 } else {
     $percorsi = @(Get-ChildItem -LiteralPath $compDir -Filter '*.json' -File -ErrorAction SilentlyContinue)
     if ($percorsi.Count -eq 0 -and $script:GuiMode -and
-        (Confirm-Box "No SE.Live composition files found in:`n$compDir`n`nIs SE.Live installed and have you created at least one canvas?`n`nBrowse for a composition file manually (e.g. portable OBS)?")) {
-        $dlg = New-Object System.Windows.Forms.OpenFileDialog
+        (Confirm-Box "No SE.Live canvas files found in:`n$compDir`n`nIs SE.Live installed, with at least one canvas?`n`nYou can also pick a canvas file yourself (e.g. for a portable OBS)." 'Browse...' 'Cancel')) {
+        $dlg = New-Object Microsoft.Win32.OpenFileDialog
         $dlg.Filter = 'SE.Live composition (*.json)|*.json'
         $dlg.Title  = 'Pick an SE.Live composition file (...\streamelements_multi-streaming\compositions\*.json)'
-        if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $percorsi = @(Get-Item -LiteralPath $dlg.FileName) }
+        if ($dlg.ShowDialog()) { $percorsi = @(Get-Item -LiteralPath $dlg.FileName) }
     }
     if ($percorsi.Count -eq 0) {
         Show-ErrorBox "No composition files found in:`n$compDir`n`nIs SE.Live installed, and have you created at least one canvas?"
@@ -908,200 +1358,400 @@ if (-not $script:GuiMode) {
 # ------------------------------------------------------------------ #
 #  6b. GUI mode                                                      #
 # ------------------------------------------------------------------ #
-$form                 = New-Object System.Windows.Forms.Form
-$form.Text            = "SE.Live Scene Tool v$($script:ToolVersion) - for SE.Live $($script:TestedSELive)"
-$form.ClientSize      = New-Object System.Drawing.Size(460, 400)
-$form.StartPosition   = 'CenterScreen'
-$form.FormBorderStyle = 'FixedDialog'
-$form.MaximizeBox     = $false
-$form.MinimizeBox     = $false
-$form.Font            = New-Object System.Drawing.Font('Segoe UI', 9)
+$mainBody = @'
+<Grid Margin="24,0,24,0">
+  <Grid.RowDefinitions>
+    <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+    <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/>
+    <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+  </Grid.RowDefinitions>
+  <TextBlock x:Name="Heading" FontFamily="Segoe UI Variable Display, Segoe UI" FontSize="22" FontWeight="SemiBold"/>
+  <TextBlock x:Name="SubHeading" Grid.Row="1" Foreground="{StaticResource Muted}" TextWrapping="Wrap" Margin="0,4,0,0" LineHeight="19"/>
 
-function New-Control([string]$Type, [int]$X, [int]$Y, [int]$W, [int]$H, [string]$Text) {
-    $c = New-Object "System.Windows.Forms.$Type"
-    $c.Location = New-Object System.Drawing.Point($X, $Y)
-    $c.Size     = New-Object System.Drawing.Size($W, $H)
-    if ($Text) { $c.Text = $Text }
-    $form.Controls.Add($c)
-    return $c
+  <Border Grid.Row="2" Background="{StaticResource Surface}" CornerRadius="10" Padding="4" Margin="0,18,0,0">
+    <UniformGrid Columns="4">
+      <RadioButton x:Name="tabDuplicate" GroupName="mode" Style="{StaticResource Tab}" Tag="&#xE8C8;" Content="Duplicate" IsChecked="True"/>
+      <RadioButton x:Name="tabRename" GroupName="mode" Style="{StaticResource Tab}" Tag="&#xE8AC;" Content="Rename"/>
+      <RadioButton x:Name="tabDelete" GroupName="mode" Style="{StaticResource Tab}" Tag="&#xE74D;" Content="Delete"/>
+      <RadioButton x:Name="tabBackups" GroupName="mode" Style="{StaticResource Tab}" Tag="&#xE81C;" Content="Backups"/>
+    </UniformGrid>
+  </Border>
+
+  <TextBlock Grid.Row="3" Text="CANVAS" Style="{StaticResource Caption}"/>
+  <ComboBox Grid.Row="4" x:Name="cmbCanvas"/>
+
+  <TextBlock Grid.Row="5" x:Name="lblList" Style="{StaticResource Caption}"/>
+  <ListBox Grid.Row="6" x:Name="lstItems" MinHeight="120">
+    <ListBox.ItemTemplate>
+      <DataTemplate>
+        <Grid>
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/>
+          </Grid.ColumnDefinitions>
+          <Ellipse Width="8" Height="8" Fill="{Binding Dot}" VerticalAlignment="Center" Margin="0,0,11,0"/>
+          <StackPanel Grid.Column="1">
+            <TextBlock Text="{Binding Title}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
+            <TextBlock Text="{Binding Sub}" Foreground="#8F96AD" FontSize="11.5" Margin="0,2,0,0" TextTrimming="CharacterEllipsis"/>
+          </StackPanel>
+          <Border Grid.Column="2" Visibility="{Binding BadgeVis}" Background="#2F3549" CornerRadius="5" Padding="7,2"
+                  VerticalAlignment="Center" Margin="8,0,0,0">
+            <TextBlock Text="{Binding Badge}" FontSize="10" FontWeight="SemiBold" Foreground="#B8BDCE"/>
+          </Border>
+        </Grid>
+      </DataTemplate>
+    </ListBox.ItemTemplate>
+  </ListBox>
+
+  <StackPanel Grid.Row="7" x:Name="pnlName">
+    <TextBlock x:Name="lblName" Style="{StaticResource Caption}"/>
+    <TextBox x:Name="txtName" TextWrapping="Wrap" MaxHeight="110"/>
+  </StackPanel>
+
+  <Border Grid.Row="8" x:Name="hintCard" CornerRadius="8" BorderThickness="1" Padding="12,10" Margin="0,16,0,0">
+    <Grid>
+      <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+      <TextBlock x:Name="hintIcon" FontFamily="Segoe MDL2 Assets" FontSize="14" Margin="0,2,10,0" VerticalAlignment="Top"/>
+      <TextBlock x:Name="hintText" Grid.Column="1" TextWrapping="Wrap" LineHeight="19"/>
+    </Grid>
+  </Border>
+
+  <StackPanel Grid.Row="9" Margin="2,16,0,0">
+    <CheckBox x:Name="chkAfter" Content="Place the copies right after the original" IsChecked="True" Margin="0,0,0,10"/>
+    <CheckBox x:Name="chkReopen"/>
+  </StackPanel>
+
+  <Border Grid.Row="10" BorderBrush="{StaticResource Line}" BorderThickness="0,1,0,0" Margin="-24,20,-24,0" Padding="24,14,24,18">
+    <Grid>
+      <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+        <Ellipse x:Name="verDot" Width="8" Height="8" Margin="0,0,8,0"/>
+        <TextBlock x:Name="verText" Foreground="{StaticResource Muted}" FontSize="11.5" VerticalAlignment="Center"/>
+      </StackPanel>
+      <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+        <Button x:Name="btnShortcut" Style="{StaticResource Ghost}" Padding="11,9" Margin="0,0,8,0"
+                ToolTip="Create a Desktop shortcut that opens the tool without any console window">
+          <TextBlock Text="&#xE71B;" FontFamily="Segoe MDL2 Assets" FontSize="13"/>
+        </Button>
+        <Button x:Name="btnAction" Style="{StaticResource Primary}" MinWidth="120"/>
+      </StackPanel>
+    </Grid>
+  </Border>
+</Grid>
+'@
+
+$script:MainWindow = New-ToolWindow 'SE.Live Scene Tool' $mainBody 540 $true
+$script:MainWindow.WindowStartupLocation = 'CenterScreen'
+# Fixed height, so switching tabs does not make the window jump: the scene list takes the free space.
+$script:MainWindow.SizeToContent = 'Manual'
+$script:MainWindow.Height = 840
+$ui = @{}
+foreach ($n in @('Heading','SubHeading','tabDuplicate','tabRename','tabDelete','tabBackups','cmbCanvas','lblList','lstItems',
+                 'pnlName','lblName','txtName','hintCard','hintIcon','hintText','chkAfter','chkReopen','verDot','verText',
+                 'btnShortcut','btnAction')) {
+    $ui[$n] = $script:MainWindow.FindName($n)
 }
 
-$rdoDuplicate = New-Control RadioButton 15  12 90 22 'Duplicate'
-$rdoRename    = New-Control RadioButton 110 12 80 22 'Rename'
-$rdoDelete    = New-Control RadioButton 195 12 75 22 'Delete'
-$rdoRestore   = New-Control RadioButton 275 12 140 22 'Restore backup'
-$rdoDuplicate.Checked = $true
-
-$lblCanvas = New-Control Label    15 44  430 18 'Canvas:'
-$cmbCanvas = New-Control ComboBox 15 63  430 24 $null
-$lblScene  = New-Control Label    15 97  430 18 'Scene to copy:'
-$cmbScene  = New-Control ComboBox 15 116 430 24 $null
-$lblName   = New-Control Label    15 150 430 18 'Name(s) of the copy - one per line for several copies:'
-$txtName   = New-Control TextBox  15 169 430 66 $null
-$lblHint   = New-Control Label    15 240 430 54 ''
-$chkAfter   = New-Control CheckBox 15 300 430 22 'Place the copies right after the original (otherwise at the end)'
-$chkRestart = New-Control CheckBox 15 326 430 22 'Reopen OBS when done'
-$lblVersion = New-Control Label   15 356 235 36 ''
-$btnOk      = New-Control Button  255 360 92 28 'Duplicate'
-$btnCancel  = New-Control Button  353 360 92 28 'Cancel'
-
-foreach ($cmb in @($cmbCanvas, $cmbScene)) { $cmb.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList }
-$txtName.Multiline     = $true
-$txtName.AcceptsReturn = $true
-$txtName.ScrollBars    = 'Vertical'
-$lblHint.ForeColor     = [System.Drawing.Color]::DimGray
-$lblVersion.ForeColor  = [System.Drawing.Color]::Gray
-$chkRestart.Checked    = $true
-$chkAfter.Checked      = $true
-$btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
-$form.CancelButton = $btnCancel
-
-$verText = "Built for SE.Live $($script:TestedSELive)`n"
-if (-not $seVersion) {
-    $verText += 'Installed SE.Live: not detected'
-} elseif ($seVersion -eq $script:TestedSELive) {
-    $verText += "Installed SE.Live: $seVersion (tested)"
-    $lblVersion.ForeColor = [System.Drawing.Color]::SeaGreen
-} else {
-    $verText += "Installed SE.Live: $seVersion (not tested)"
-    $lblVersion.ForeColor = [System.Drawing.Color]::DarkOrange
-}
-$lblVersion.Text = $verText
-foreach ($c in $canvasList) { [void]$cmbCanvas.Items.Add($c.Name) }
-
+$script:Mode        = 'duplicate'
+$script:Changed     = $false
 $script:LastDefault = ''
 $script:Backups     = @()
+$script:Refreshing  = $false   # true while the list is rebuilt, so selection events don't fire half-way
+$script:Dot         = [string][char]0x00B7
 
-function Get-CurrentCanvas { return $canvasList[$cmbCanvas.SelectedIndex] }
+$script:ModeText = @{
+    duplicate = @{ Head = 'Duplicate a scene'; Action = 'Duplicate'; List = 'SCENE TO COPY'
+                   Sub  = 'Copies a scene of the canvas with all its sources, positions, crops and filters.'
+                   Name = "NAME OF THE COPY  $($script:Dot)  ONE PER LINE FOR SEVERAL" }
+    rename    = @{ Head = 'Rename a scene'; Action = 'Rename'; List = 'SCENE TO RENAME'; Name = 'NEW NAME'
+                   Sub  = 'Changes the name of a scene in the canvas file.' }
+    delete    = @{ Head = 'Delete a scene'; Action = 'Delete'; List = 'SCENE TO DELETE'
+                   Sub  = 'Removes a scene from the canvas; its sources stay in OBS.' }
+    backups   = @{ Head = 'Restore a backup'; Action = 'Restore'; List = "BACKUPS  $($script:Dot)  NEWEST FIRST"
+                   Sub  = 'Every change saves a backup first. Pick one to put the canvas back as it was.' }
+}
 
-$UpdateHint = {
+function Get-CurrentCanvas { return $canvasList[$ui.cmbCanvas.SelectedIndex] }
+
+function Set-Hint([string]$Kind, [string]$Text) {
+    if (-not $Text) { $ui.hintCard.Visibility = 'Collapsed'; return }
+    $k = $script:Kinds[$Kind]
+    $ui.hintCard.Visibility  = 'Visible'
+    $ui.hintCard.Background  = New-Brush $k.Color 0x1C
+    $ui.hintCard.BorderBrush = New-Brush $k.Color 0x50
+    $ui.hintIcon.Foreground  = New-Brush $k.Color
+    $ui.hintIcon.Text        = [string][char]$k.Glyph
+    $ui.hintText.Text        = $Text
+}
+
+function New-ListItem([string]$Key, [string]$Title, [string]$Sub, [string]$Dot, [string]$Badge) {
+    $vis = if ($Badge) { 'Visible' } else { 'Collapsed' }
+    return [pscustomobject]@{ Key = $Key; Title = $Title; Sub = $Sub; Dot = $Dot; Badge = $Badge; BadgeVis = $vis }
+}
+
+function Get-SceneItems($Canvas) {
+    $scenes = @(Get-SceneList $Canvas.Dati)
+    $items = New-Object System.Collections.ArrayList
+    for ($i = 0; $i -lt $scenes.Count; $i++) {
+        $s = $scenes[$i]
+        $n = @(@($s.sources) | Where-Object { $null -ne $_ }).Count
+        $sub = if ($n -eq 1) { '1 source' } else { "$n sources" }
+        if ($s.active) { $sub += "  $($script:Dot)  active scene" }
+        $dot   = if ($s.active) { '#2FBF84' } else { '#3A4058' }
+        $badge = if ($i -eq 0) { 'FIRST' } else { '' }
+        [void]$items.Add((New-ListItem ([string]$s.name) ([string]$s.name) $sub $dot $badge))
+    }
+    return ,$items
+}
+
+function Get-BackupItems($Canvas) {
+    $script:Backups = Get-Backups $Canvas
+    $items = New-Object System.Collections.ArrayList
+    for ($i = 0; $i -lt $script:Backups.Count; $i++) {
+        $b = $script:Backups[$i]
+        if ($null -eq $b.Scenes) { $sub = 'unreadable' }
+        else {
+            $plural = if ($b.Scenes.Count -eq 1) { '' } else { 's' }
+            $sub = "$($b.Scenes.Count) scene$plural  $($script:Dot)  $($b.Scenes -join ', ')"
+        }
+        $title = $b.When.ToString('d MMM yyyy, HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
+        $badge = if ($i -eq 0) { 'LATEST' } else { '' }
+        [void]$items.Add((New-ListItem $b.Path $title $sub '#3A4058' $badge))
+    }
+    return ,$items
+}
+
+# Hint, default name and button state for the current mode and selection.
+function Update-Context {
     $canvas = Get-CurrentCanvas
-    $lblHint.ForeColor = [System.Drawing.Color]::DimGray
-    $btnOk.Enabled = $true
-    if ($rdoRestore.Checked) {
-        if ($script:Backups.Count -eq 0) {
-            $lblHint.Text = 'No backups yet for this canvas: the tool creates one before every change.'
-            $btnOk.Enabled = $false
-        } elseif ($cmbScene.SelectedIndex -ge 0) {
-            $b = $script:Backups[$cmbScene.SelectedIndex]
-            if ($null -eq $b.Scenes) { $lblHint.Text = 'This backup cannot be read.'; $btnOk.Enabled = $false }
-            else { $lblHint.Text = "Scenes in this backup: $($b.Scenes -join ', ')`nThe current state is backed up too before restoring." }
-        }
-    } elseif ($rdoRename.Checked) {
-        $lblHint.Text = "Use a name no other scene on this canvas has."
-        if ($cmbScene.SelectedIndex -eq 0) {
-            $warn = Get-FirstSceneWarning $canvas ([string]$cmbScene.SelectedItem)
-            if ($warn) { $lblHint.Text = $warn; $lblHint.ForeColor = [System.Drawing.Color]::DarkOrange }
-            else { $lblHint.Text = "First scene of the canvas: its name must not be used anywhere else in OBS (scenes or sources, any canvas), otherwise SE.Live adds ' 1'. The tool checks it for you." }
-        }
-    } elseif ($rdoDelete.Checked) {
-        $scene = @(Get-SceneList $canvas.Dati)[[Math]::Max(0, $cmbScene.SelectedIndex)]
-        if ($scene -and $scene.active) {
-            $lblHint.Text = "This is the active scene of the canvas: switch the canvas to another scene in OBS first, then delete it."
-            $btnOk.Enabled = $false
-        } else {
-            $lblHint.Text = "The scene is removed from the canvas (its sources stay in OBS). A backup is made first, so you can bring it back with Restore backup."
-        }
-        $lblHint.ForeColor = [System.Drawing.Color]::DarkOrange
-    } else {
-        $lblHint.Text = "Use brand-new names never used before on this canvas. The copy gets the same sources, positions, crops and filters."
-    }
-    if ($canvas.FormatIssue) {
-        $lblHint.Text = "Unsupported file format ($($canvas.FormatIssue)). SE.Live probably changed something: the tool needs an update."
-        $lblHint.ForeColor = [System.Drawing.Color]::Firebrick
-        $btnOk.Enabled = $false
-    }
-}
-$UpdateName = {
-    if ($rdoRestore.Checked -or $rdoDelete.Checked -or -not $cmbScene.SelectedItem) { return }
-    if ($rdoRename.Checked) {
-        $default = [string]$cmbScene.SelectedItem
-        # A first scene that SE.Live shows as "<name> 1": offer a name that will stick.
-        if ($cmbScene.SelectedIndex -eq 0 -and (Get-FirstSceneClash (Get-CurrentCanvas) $default)) {
-            $default = Get-SafeFirstSceneName (Get-CurrentCanvas) $default
-        }
-    }
-    else { $default = "$($cmbScene.SelectedItem) - Copy" }
-    if ($txtName.Text -eq $script:LastDefault -or [string]::IsNullOrWhiteSpace($txtName.Text)) {
-        $txtName.Text = $default
-    }
-    $script:LastDefault = $default
-}
-$UpdateList = {
-    $cmbScene.Items.Clear()
-    $canvas = Get-CurrentCanvas
-    if ($rdoRestore.Checked) {
-        $script:Backups = Get-Backups $canvas
-        foreach ($b in $script:Backups) { [void]$cmbScene.Items.Add((Format-Backup $b)) }
-    } else {
-        foreach ($s in (Get-SceneList $canvas.Dati)) { [void]$cmbScene.Items.Add([string]$s.name) }
-    }
-    if ($cmbScene.Items.Count -gt 0) { $cmbScene.SelectedIndex = 0 }
-    & $UpdateName
-    & $UpdateHint
-}
-$UpdateMode = {
-    if ($rdoRestore.Checked) {
-        $lblScene.Text = 'Backup to restore (newest first):'; $btnOk.Text = 'Restore'
-    } elseif ($rdoRename.Checked) {
-        $lblScene.Text = 'Scene to rename:'; $lblName.Text = 'New name:'; $btnOk.Text = 'Rename'
-    } elseif ($rdoDelete.Checked) {
-        $lblScene.Text = 'Scene to delete:'; $btnOk.Text = 'Delete'
-    } else {
-        $lblScene.Text = 'Scene to copy:'; $lblName.Text = 'Name(s) of the copy - one per line for several copies:'; $btnOk.Text = 'Duplicate'
-    }
-    $noName = $rdoRestore.Checked -or $rdoDelete.Checked
-    $lblName.Visible  = -not $noName
-    $txtName.Visible  = -not $noName
-    $chkAfter.Visible = $rdoDuplicate.Checked
-    $lblHint.Top      = if ($noName) { 150 } else { 240 }
-    & $UpdateList
-}
-$cmbCanvas.Add_SelectedIndexChanged($UpdateList)
-$cmbScene.Add_SelectedIndexChanged({ & $UpdateName; & $UpdateHint })
-$rdoDuplicate.Add_CheckedChanged({ if ($this.Checked) { & $UpdateMode } })
-$rdoRename.Add_CheckedChanged({ if ($this.Checked) { & $UpdateMode } })
-$rdoDelete.Add_CheckedChanged({ if ($this.Checked) { & $UpdateMode } })
-$rdoRestore.Add_CheckedChanged({ if ($this.Checked) { & $UpdateMode } })
-$cmbCanvas.SelectedIndex = 0
-& $UpdateMode
+    $sel    = $ui.lstItems.SelectedItem
+    $idx    = $ui.lstItems.SelectedIndex
+    $scenes = @(Get-SceneList $canvas.Dati)
+    $ui.btnAction.IsEnabled = ($null -ne $sel)
 
-$btnOk.Add_Click({
-    try {
-        $canvas = Get-CurrentCanvas
-        if ($rdoRestore.Checked) {
-            $b = $script:Backups[$cmbScene.SelectedIndex]
-            if (-not (Confirm-Box "Restore canvas '$($canvas.Name)' to the backup of $('{0:yyyy-MM-dd HH:mm:ss}' -f $b.When)?`n`nScenes after restore: $($b.Scenes -join ', ')")) { return }
-            $res = Invoke-BackupRestore -Canvas $canvas -BackupPath $b.Path
-            $msg = "Done! Canvas restored ($($res.Scenes.Count) scenes).`n`nBackup of the state before restoring:`n$($res.Backup)"
-        } elseif ($rdoDelete.Checked) {
-            $selected = [string]$cmbScene.SelectedItem
-            if (-not (Confirm-Box "Delete scene '$selected' from canvas '$($canvas.Name)'?`n`nA backup is made first.")) { return }
-            $res = Invoke-SceneDelete -Canvas $canvas -SceneName $selected
-            $msg = "Done! Scene '$selected' deleted.`n`nBackup of the previous state:`n$($res.Backup)$($res.Note)"
+    if ($sel -and ($script:Mode -eq 'duplicate' -or $script:Mode -eq 'rename')) {
+        if ($script:Mode -eq 'rename') {
+            $default = $sel.Key
+            # A first scene that SE.Live shows as "<name> 1": offer a name that will stick.
+            if ($idx -eq 0 -and (Get-FirstSceneClash $canvas $default)) { $default = Get-SafeFirstSceneName $canvas $default }
         } else {
-            $selected = [string]$cmbScene.SelectedItem
-            $names    = Split-Names @($txtName.Text)
-            if ($rdoRename.Checked) {
-                if ($names.Count -ne 1) { throw "Type exactly one new name." }
-                $res = Invoke-SceneRename -Canvas $canvas -SceneName $selected -TargetName $names[0]
-                $msg = "Done! Scene '$selected' renamed to '$($names[0])'.`n`nBackup of the original:`n$($res.Backup)$($res.Note)"
+            $default = "$($sel.Key) - Copy"
+        }
+        if ($ui.txtName.Text -eq $script:LastDefault -or [string]::IsNullOrWhiteSpace($ui.txtName.Text)) { $ui.txtName.Text = $default }
+        $script:LastDefault = $default
+    }
+
+    switch ($script:Mode) {
+        'duplicate' { Set-Hint 'info' 'Use names not already used on this canvas. For several copies at once, write one name per line.' }
+        'rename' {
+            if ($idx -eq 0) {
+                $warn = if ($sel) { Get-FirstSceneWarning $canvas $sel.Key } else { '' }
+                if ($warn) { Set-Hint 'warn' $warn }
+                else { Set-Hint 'info' "This is the first scene: its name must not be used anywhere else in OBS (scenes or sources), otherwise SE.Live adds ' 1'. The tool checks it for you." }
             } else {
-                $res = Invoke-SceneDuplicate -Canvas $canvas -SceneName $selected -TargetNames $names -AfterOriginal $chkAfter.Checked
-                $what = if ($names.Count -eq 1) { "as '$($names[0])'" } else { "$($names.Count) times: $($names -join ', ')" }
-                $msg = "Done! Scene '$selected' duplicated $what.`n`nBackup of the original:`n$($res.Backup)"
+                Set-Hint 'info' "Names also used on the main canvas are fine here. Renaming from the SE.Live dock is different: there SE.Live would add ' 1'."
             }
-            $msg += Format-Warnings $res.Warnings
         }
-        if ($chkRestart.Checked) {
-            if (Start-Obs) { $msg += "`n`nReopening OBS: check the canvas dock." }
-            else           { $msg += "`n`nCould not find the OBS executable: please reopen it manually." }
+        'delete' {
+            if ($idx -ge 0 -and $scenes[$idx].active) {
+                Set-Hint 'warn' 'This is the active scene of the canvas. Switch the canvas to another scene in OBS first, then delete it.'
+                $ui.btnAction.IsEnabled = $false
+            } elseif ($scenes.Count -le 1) {
+                Set-Hint 'warn' 'This is the only scene of the canvas, so it cannot be deleted.'
+                $ui.btnAction.IsEnabled = $false
+            } else {
+                Set-Hint 'info' 'The scene is removed from the canvas; its sources stay in OBS. A backup is saved first, so you can bring it back from Backups.'
+            }
         }
-        Show-InfoBox $msg
-        $form.Close()
+        'backups' {
+            if ($script:Backups.Count -eq 0) {
+                Set-Hint 'info' 'No backups yet for this canvas: the tool saves one before every change.'
+            } elseif ($idx -ge 0 -and $null -eq $script:Backups[$idx].Scenes) {
+                Set-Hint 'error' 'This backup cannot be read.'
+                $ui.btnAction.IsEnabled = $false
+            } elseif ($idx -ge 0) {
+                Set-Hint 'info' ("Scenes in this backup: " + ($script:Backups[$idx].Scenes -join ', ') + ". The current state is backed up first, so a restore can be undone too.")
+            }
+        }
+    }
+    if ($canvas.FormatIssue -and $script:Mode -ne 'backups') {
+        Set-Hint 'error' "This canvas file is not in the format the tool knows ($($canvas.FormatIssue)). SE.Live probably changed something: the tool needs an update."
+        $ui.btnAction.IsEnabled = $false
+    }
+}
+
+function Update-List([string]$SelectKey) {
+    $canvas = Get-CurrentCanvas
+    if ($script:Mode -eq 'backups') { $items = Get-BackupItems $canvas } else { $items = Get-SceneItems $canvas }
+    $script:Refreshing = $true
+    $ui.lstItems.ItemsSource = $items
+    $pick = 0
+    if ($SelectKey) {
+        for ($i = 0; $i -lt $items.Count; $i++) { if ($items[$i].Key -ceq $SelectKey) { $pick = $i; break } }
+    }
+    if ($items.Count -gt 0) {
+        $ui.lstItems.SelectedIndex = $pick
+        $ui.lstItems.ScrollIntoView($ui.lstItems.SelectedItem)
+    }
+    $script:Refreshing = $false
+    Update-Context
+}
+
+function Set-Mode([string]$Mode) {
+    # Keep the same scene selected when moving between the scene tabs.
+    $keep = $null
+    if ($script:Mode -ne 'backups' -and $Mode -ne 'backups' -and $ui.lstItems.SelectedItem) { $keep = $ui.lstItems.SelectedItem.Key }
+    $script:Mode = $Mode
+    $t = $script:ModeText[$Mode]
+    $ui.Heading.Text      = $t.Head
+    $ui.SubHeading.Text   = $t.Sub
+    $ui.lblList.Text      = $t.List
+    $ui.btnAction.Content = $t.Action
+    $hasName = ($Mode -eq 'duplicate' -or $Mode -eq 'rename')
+    $ui.pnlName.Visibility  = if ($hasName) { 'Visible' } else { 'Collapsed' }
+    $ui.lblName.Text        = $t.Name
+    $ui.txtName.AcceptsReturn = ($Mode -eq 'duplicate')
+    $ui.txtName.MinHeight   = if ($Mode -eq 'duplicate') { 64 } else { 0 }
+    $ui.chkAfter.Visibility = if ($Mode -eq 'duplicate') { 'Visible' } else { 'Collapsed' }
+    $style = if ($Mode -eq 'delete') { 'DangerBtn' } else { 'Primary' }
+    $ui.btnAction.Style = $script:MainWindow.FindResource($style)
+    $ui.txtName.Text = ''
+    $script:LastDefault = ''
+    Update-List $keep
+}
+
+function Update-CanvasFromDisk($Canvas) {
+    $comp = Read-Composition $Canvas.Path
+    $Canvas.Testo  = $comp.Text
+    $Canvas.Dati   = ConvertFrom-Json -InputObject $comp.Text
+    $Canvas.HasBom = $comp.HasBom
+    $Canvas.Stamp  = $comp.Stamp
+    $Canvas.Length = $comp.Length
+    $Canvas.FormatIssue = Test-CompositionFormat $Canvas.Dati
+}
+
+function Invoke-Action {
+    $canvas = Get-CurrentCanvas
+    $sel = $ui.lstItems.SelectedItem
+    if (-not $sel -or -not $ui.btnAction.IsEnabled) { return }
+    try {
+        $kind = 'ok'
+        $select = $sel.Key
+        switch ($script:Mode) {
+            'duplicate' {
+                $names = Split-Names @($ui.txtName.Text)
+                $res = Invoke-SceneDuplicate -Canvas $canvas -SceneName $sel.Key -TargetNames $names -AfterOriginal ([bool]$ui.chkAfter.IsChecked)
+                if ($names.Count -eq 1) { $msg = "'$($names[0])' created from '$($sel.Key)'." }
+                else { $msg = "$($names.Count) copies of '$($sel.Key)' created: $($names -join ', ')." }
+            }
+            'rename' {
+                $names = Split-Names @($ui.txtName.Text)
+                if ($names.Count -ne 1) { throw 'Type exactly one new name.' }
+                $res = Invoke-SceneRename -Canvas $canvas -SceneName $sel.Key -TargetName $names[0]
+                $msg = "'$($sel.Key)' renamed to '$($names[0])'."
+                $select = $names[0]
+            }
+            'delete' {
+                $answer = Show-Dialog "Delete '$($sel.Key)' from canvas '$($canvas.Name)'?`n`nIts sources stay in OBS, and a backup is saved first." `
+                    'question' @('Delete', 'Cancel') 'Delete this scene?' -Danger
+                if ($answer -ne 'Delete') { return }
+                $res = Invoke-SceneDelete -Canvas $canvas -SceneName $sel.Key
+                $msg = "'$($sel.Key)' deleted."
+                $select = $null
+            }
+            'backups' {
+                $b = $script:Backups[$ui.lstItems.SelectedIndex]
+                $answer = Show-Dialog ("Put canvas '$($canvas.Name)' back the way it was on $($sel.Title)?`n`nScenes after the restore: " + ($b.Scenes -join ', ')) `
+                    'question' @('Restore', 'Cancel') 'Restore this backup?'
+                if ($answer -ne 'Restore') { return }
+                $res = Invoke-BackupRestore -Canvas $canvas -BackupPath $b.Path
+                Update-CanvasFromDisk $canvas
+                $msg = "Canvas restored ($($res.Scenes.Count) scenes)."
+                $select = $null
+            }
+        }
+        $script:Changed = $true
+        $script:TakenCache = @{}
+        $msg += "`nBackup of the previous state: " + (Split-Path -Path $res.Backup -Leaf)
+        if ($res.Note) { $msg += $res.Note; $kind = 'warn' }
+        if ($res.Warnings -and @($res.Warnings).Count -gt 0) { $msg += Format-Warnings $res.Warnings }
+        $ui.txtName.Text = ''
+        $script:LastDefault = ''
+        Update-List $select
+        Set-Hint $kind $msg
     } catch {
-        Show-ErrorBox $_.Exception.Message
+        Set-Hint 'error' $_.Exception.Message
+    }
+}
+
+# Writes the app icon as a PNG-in-ICO file (supported since Windows Vista) for the Desktop shortcut.
+function Save-ToolIco([string]$Path) {
+    $enc = New-Object System.Windows.Media.Imaging.PngBitmapEncoder
+    $enc.Frames.Add([System.Windows.Media.Imaging.BitmapFrame]::Create((Get-ToolIcon)))
+    $ms = New-Object System.IO.MemoryStream
+    $enc.Save($ms)
+    $png = $ms.ToArray()
+    $bw = New-Object System.IO.BinaryWriter([System.IO.File]::Create($Path))
+    try {
+        $bw.Write([uint16]0); $bw.Write([uint16]1); $bw.Write([uint16]1)                    # header: icon file, 1 image
+        $bw.Write([byte]0); $bw.Write([byte]0); $bw.Write([byte]0); $bw.Write([byte]0)       # 256x256, no palette
+        $bw.Write([uint16]1); $bw.Write([uint16]32); $bw.Write([uint32]$png.Length); $bw.Write([uint32]22)
+        $bw.Write($png)
+    } finally { $bw.Close() }
+}
+
+# The shortcut starts PowerShell through a headless console host, so no console window ever appears.
+function New-DesktopShortcut {
+    $dir = Split-Path -Path $script:ScriptPath -Parent
+    $ico = Join-Path $dir 'SELive-Scene-Tool.ico'
+    Save-ToolIco $ico
+    $lnkPath = Join-Path ([Environment]::GetFolderPath('Desktop')) 'SE.Live Scene Tool.lnk'
+    $lnk = (New-Object -ComObject WScript.Shell).CreateShortcut($lnkPath)
+    $lnk.TargetPath       = Join-Path $env:WINDIR 'System32\conhost.exe'
+    $lnk.Arguments        = "--headless powershell.exe -NoProfile -Sta -ExecutionPolicy Bypass -File `"$($script:ScriptPath)`""
+    $lnk.WorkingDirectory = $dir
+    $lnk.IconLocation     = "$ico,0"
+    $lnk.Description      = 'Duplicate, rename and manage SE.Live canvas scenes'
+    $lnk.Save()
+    return $lnkPath
+}
+
+# --- static texts ---
+if (-not $seVersion) {
+    $ui.verDot.Fill = New-Brush '#8F96AD'
+    $ui.verText.Text = "SE.Live version not detected  $($script:Dot)  built for $($script:TestedSELive)"
+} elseif ($seVersion -eq $script:TestedSELive) {
+    $ui.verDot.Fill = New-Brush '#2FBF84'
+    $ui.verText.Text = "SE.Live $seVersion  $($script:Dot)  tested version"
+} else {
+    $ui.verDot.Fill = New-Brush '#F2A93B'
+    $ui.verText.Text = "SE.Live $seVersion  $($script:Dot)  not tested (built for $($script:TestedSELive))"
+}
+$ui.verText.ToolTip = "Tool v$($script:ToolVersion), built and tested for SE.Live $($script:TestedSELive) on OBS $($script:TestedObs)"
+if ($script:ObsWasRunning) { $ui.chkReopen.Content = 'Reopen OBS when I close this window'; $ui.chkReopen.IsChecked = $true }
+else                       { $ui.chkReopen.Content = 'Start OBS when I close this window';  $ui.chkReopen.IsChecked = $false }
+foreach ($c in $canvasList) { [void]$ui.cmbCanvas.Items.Add($c.Name) }
+
+# --- events ---
+$ui.cmbCanvas.Add_SelectionChanged({ Update-List $null })
+$ui.lstItems.Add_SelectionChanged({ if (-not $script:Refreshing) { Update-Context } })
+$ui.tabDuplicate.Add_Checked({ Set-Mode 'duplicate' })
+$ui.tabRename.Add_Checked({ Set-Mode 'rename' })
+$ui.tabDelete.Add_Checked({ Set-Mode 'delete' })
+$ui.tabBackups.Add_Checked({ Set-Mode 'backups' })
+$ui.btnAction.Add_Click({ Invoke-Action })
+$ui.txtName.Add_KeyDown({ if ($_.Key -eq 'Return' -and $script:Mode -eq 'rename') { Invoke-Action } })
+$ui.btnShortcut.Add_Click({
+    try {
+        [void](New-DesktopShortcut)
+        Set-Hint 'ok' "Shortcut 'SE.Live Scene Tool' created on your Desktop: it opens the tool with no console window at all."
+    } catch { Set-Hint 'error' "Could not create the shortcut: $($_.Exception.Message)" }
+})
+$script:MainWindow.Add_ContentRendered({ $this.Activate() })
+$script:MainWindow.Add_Closing({
+    if ($ui.chkReopen.IsChecked -and -not (Start-Obs)) {
+        [void](Show-Dialog 'Could not find the OBS executable: please start OBS yourself.' 'warn')
     }
 })
 
-[void]$form.ShowDialog()
+$ui.cmbCanvas.SelectedIndex = 0
+Set-Mode 'duplicate'
+[void]$script:MainWindow.ShowDialog()
