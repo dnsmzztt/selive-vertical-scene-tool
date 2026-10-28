@@ -36,6 +36,18 @@ This looks closely related to #46 (scenes/sources randomly duplicated with a "1"
 2. In a dock session, the user deletes the *empty, respawned* "Scene 1" entry and another test scene, then closes OBS.
 3. The composition file saved at shutdown no longer contains "Valorant - Vertical" — the renamed original was removed, not the entities the user deleted. (Timestamped file snapshots available for the whole sequence.)
 
+## Update (October 2026, core 26.9.4.994): root cause of the " 1" suffix
+
+On 26.9.4 the first scene of a custom canvas comes back as "<name> 1" (e.g. "Valorant" → "Valorant 1") whenever its name is also used by a scene or source elsewhere in OBS. Renaming it back from the dock fails the same way. Tracing it in this repo's source:
+
+- `SECustomVideoComposition` creates the canvas with a placeholder scene `GetUniqueSceneName("Scene")` (`SEVideoComposition.cpp`). The first saved scene is then restored by renaming it.
+- `addScene` → `SEVideoCompositionBase::AddScene` → `GetUniqueSceneName`: uniqueness is checked **only among the scenes of that composition**.
+- `setScenePropertiesById` → `SEObsSceneManager::SetObsScenePropertiesById` → `ObsSetUniqueSourceName` → `isSourceNameUnique`: uniqueness is checked against **`obs_get_source_by_name` (every OBS source, including the main canvas's scenes) plus every SE.Live composition's scenes and scene items**, and " 1", " 2"... is appended silently.
+
+So a vertical scene may be *added* as "Valorant" next to a horizontal "Valorant", but it can never be *renamed* to it. Since the first scene is restored through a rename at every startup, it always ends up as "Valorant 1". Other scenes, restored through `addScene`, keep their name (verified with "Fortnite").
+
+Suggested fix: when the scene belongs to a custom (private) canvas, have `SetObsScenePropertiesById` use the same per-composition rule as `AddScene` (`videoComposition->GetUniqueSceneName`, ignoring the scene being renamed). These scenes are private, so they don't share OBS's global name table anyway.
+
 ## Expected behavior
 
 The composition file (or at least the dock UI actions) should be authoritative: renames should persist, deleting a scene should delete exactly that scene, and externally added scenes shouldn't cause other scenes to be re-labeled or removed.
