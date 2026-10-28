@@ -622,6 +622,72 @@ function Find-NameReferences($Canvas, [string]$Name) {
     return ,$hits
 }
 
+# SE.Live restores the FIRST scene of a canvas by renaming its placeholder scene, and its rename (unlike
+# adding a scene) wants a name that no OBS scene/source and no SE.Live scene or scene entry uses yet;
+# otherwise it silently appends " 1" (obs-streamelements-core: SEObsSceneManager::ObsSetUniqueSourceName).
+# The same rule applies to every rename made from the SE.Live dock.
+function Get-ObsRoot([string]$CompositionPath) {
+    # compositions -> streamelements_multi-streaming -> scoped_config_storage -> obs-streamelements-core -> plugin_config -> obs-studio
+    $p = $CompositionPath
+    for ($k = 0; $k -lt 6; $k++) { $p = Split-Path -Path $p -Parent }
+    return $p
+}
+
+function Get-TakenNames($Canvas) {
+    if ($script:TakenCache.ContainsKey($Canvas.Path)) { return $script:TakenCache[$Canvas.Path] }
+    $taken = @{}   # lower-case name -> where it is used
+    try {
+        $root = Get-ObsRoot $Canvas.Path
+        $ini  = Join-Path $root 'user.ini'
+        if (-not (Test-Path -LiteralPath $ini)) { $ini = Join-Path $root 'global.ini' }
+        $m = Select-String -LiteralPath $ini -Pattern '^SceneCollectionFile=(.+)$' -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($m) {
+            $leaf = $m.Matches[0].Groups[1].Value.Trim()
+            if ($leaf -notlike '*.json') { $leaf += '.json' }
+            $coll = ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText((Join-Path (Join-Path $root 'basic\scenes') $leaf)))
+            foreach ($s in @(@($coll.sources) + @($coll.groups) | Where-Object { $null -ne $_ })) {
+                $k = ([string]$s.name).ToLowerInvariant()
+                if (-not $taken.ContainsKey($k)) { $taken[$k] = "the OBS scene/source '$($s.name)'" }
+            }
+        }
+    } catch { }
+    foreach ($c in $script:AllCanvases) {
+        foreach ($s in (Get-SceneList $c.Dati)) {
+            $k = ([string]$s.name).ToLowerInvariant()
+            if ($c.Path -ne $Canvas.Path -and -not $taken.ContainsKey($k)) { $taken[$k] = "scene '$($s.name)' on canvas '$($c.Name)'" }
+            foreach ($src in @(@($s.sources) | Where-Object { $null -ne $_ })) {
+                $k = ([string]$src.name).ToLowerInvariant()
+                if (-not $taken.ContainsKey($k)) { $taken[$k] = "source '$($src.name)' on canvas '$($c.Name)'" }
+            }
+        }
+    }
+    $script:TakenCache[$Canvas.Path] = $taken
+    return $taken
+}
+
+# $null when $Name is safe as the first scene of $Canvas, otherwise where else it is used.
+function Get-FirstSceneClash($Canvas, [string]$Name) {
+    $taken = Get-TakenNames $Canvas
+    $k = $Name.ToLowerInvariant()
+    if ($taken.ContainsKey($k)) { return $taken[$k] }
+    return $null
+}
+
+function Get-SafeFirstSceneName($Canvas, [string]$Name) {
+    # The first scene itself is the one being renamed, so its current name does not count as taken.
+    $own = @(Get-SceneList $Canvas.Dati | Select-Object -Skip 1 | ForEach-Object { ([string]$_.name).ToLowerInvariant() })
+    $base = "$Name - Vertical"
+    $cand = $base; $n = 1
+    while ((Get-FirstSceneClash $Canvas $cand) -or ($own -contains $cand.ToLowerInvariant())) { $n++; $cand = "$base $n" }
+    return $cand
+}
+
+function Get-FirstSceneWarning($Canvas, [string]$Name) {
+    $where = Get-FirstSceneClash $Canvas $Name
+    if (-not $where) { return '' }
+    return "The first scene '$Name' has the same name as $where, so SE.Live shows it as '$Name 1'. Give it a name used nowhere else in OBS, e.g. '$(Get-SafeFirstSceneName $Canvas $Name)'."
+}
+
 function Split-Names([string[]]$Names) {
     return ,@($Names | ForEach-Object { $_ -split "\||`r?`n" } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 }
@@ -646,18 +712,30 @@ function Invoke-SceneDuplicate($Canvas, [string]$SceneName, [string[]]$TargetNam
 
 function Invoke-SceneRename($Canvas, [string]$SceneName, [string]$TargetName) {
     Assert-CanvasUsable $Canvas
-    $isFirst = (Find-SceneIndex $Canvas.Dati $SceneName) -eq 0
+    if ((Find-SceneIndex $Canvas.Dati $SceneName) -eq 0) {
+        $where = Get-FirstSceneClash $Canvas $TargetName
+        if ($where) {
+            throw ("'$SceneName' is the first scene of the canvas, and SE.Live gives the first scene a name used nowhere else in OBS. " +
+                   "'$TargetName' is already $where, so SE.Live would show '$TargetName 1'. Use a different name, e.g. '$(Get-SafeFirstSceneName $Canvas $TargetName)'.")
+        }
+    }
     $text = Rename-SceneInText $Canvas.Testo $SceneName $TargetName
     $backup = Save-Composition $Canvas $text
-    $note = ''
-    if ($isFirst) { $note = "`n`nNOTE: this is the first scene of the canvas. SE.Live decides that name by itself and will likely keep showing the old one: rename it from the SE.Live dock instead." }
-    return [pscustomobject]@{ Backup = $backup; Warnings = (Find-NameReferences $Canvas $SceneName); Note = $note }
+    return [pscustomobject]@{ Backup = $backup; Warnings = (Find-NameReferences $Canvas $SceneName); Note = '' }
 }
 
 function Invoke-SceneDelete($Canvas, [string]$SceneName) {
     Assert-CanvasUsable $Canvas
+    $wasFirst = (Find-SceneIndex $Canvas.Dati $SceneName) -eq 0
     $text = Remove-SceneInText $Canvas.Testo $SceneName
-    return [pscustomobject]@{ Backup = (Save-Composition $Canvas $text); Warnings = @() }
+    $backup = Save-Composition $Canvas $text
+    $note = ''
+    if ($wasFirst) {
+        $next = [string](Get-SceneList $Canvas.Dati)[0].name
+        $warn = Get-FirstSceneWarning $Canvas $next
+        if ($warn) { $note = "`n`nNOTE: '$next' is now the first scene. $warn" }
+    }
+    return [pscustomobject]@{ Backup = $backup; Warnings = @(); Note = $note }
 }
 
 function Get-Backups($Canvas) {
@@ -747,6 +825,8 @@ if ($canvasList.Count -eq 0) {
     exit 1
 }
 $seVersion = Get-SELiveVersion $canvasList[0].Path
+$script:AllCanvases = $canvasList
+$script:TakenCache  = @{}
 
 # ------------------------------------------------------------------ #
 #  6a. Command-line mode                                             #
@@ -761,6 +841,11 @@ if ($List) {
         foreach ($s in (Get-SceneList $c.Dati)) {
             $mark = if ($s.active) { '*' } else { ' ' }
             Write-Host ("  {0} {1}  ({2} sources)" -f $mark, $s.name, @(@($s.sources) | Where-Object { $null -ne $_ }).Count)
+        }
+        $first = @(Get-SceneList $c.Dati)
+        if ($first.Count -gt 0) {
+            $warn = Get-FirstSceneWarning $c ([string]$first[0].name)
+            if ($warn) { Write-Host "  WARNING: $warn" -ForegroundColor Yellow }
         }
         Write-Host ("  backups: {0}" -f (Get-Backups $c).Count)
     }
@@ -785,7 +870,7 @@ if (-not $script:GuiMode) {
         } elseif ($Delete) {
             if (-not $Scene) { throw "-Delete needs -Scene." }
             $res = Invoke-SceneDelete -Canvas $target -SceneName $Scene
-            $msg = "Done! Scene '$Scene' deleted."
+            $msg = "Done! Scene '$Scene' deleted.$($res.Note)"
         } else {
             if (-not $Scene -or $names.Count -eq 0) { throw "In -NoGui mode you must pass -Scene and -NewName (or -Delete, -RestoreFrom, -List)." }
             if ($Rename) {
@@ -888,12 +973,12 @@ $UpdateHint = {
             else { $lblHint.Text = "Scenes in this backup: $($b.Scenes -join ', ')`nThe current state is backed up too before restoring." }
         }
     } elseif ($rdoRename.Checked) {
+        $lblHint.Text = "Use a name no other scene on this canvas has."
         if ($cmbScene.SelectedIndex -eq 0) {
-            $lblHint.Text = "This is the first scene of the canvas: SE.Live decides its name by itself and ignores a rename made here. Rename it from the SE.Live dock instead."
-        } else {
-            $lblHint.Text = "Renaming a scene SE.Live already knows may be reverted by SE.Live. If you just need the right name, duplicate with the new name instead."
+            $warn = Get-FirstSceneWarning $canvas ([string]$cmbScene.SelectedItem)
+            if ($warn) { $lblHint.Text = $warn; $lblHint.ForeColor = [System.Drawing.Color]::DarkOrange }
+            else { $lblHint.Text = "First scene of the canvas: its name must not be used anywhere else in OBS (scenes or sources, any canvas), otherwise SE.Live adds ' 1'. The tool checks it for you." }
         }
-        $lblHint.ForeColor = [System.Drawing.Color]::DarkOrange
     } elseif ($rdoDelete.Checked) {
         $scene = @(Get-SceneList $canvas.Dati)[[Math]::Max(0, $cmbScene.SelectedIndex)]
         if ($scene -and $scene.active) {
@@ -914,8 +999,14 @@ $UpdateHint = {
 }
 $UpdateName = {
     if ($rdoRestore.Checked -or $rdoDelete.Checked -or -not $cmbScene.SelectedItem) { return }
-    if ($rdoRename.Checked) { $default = [string]$cmbScene.SelectedItem }
-    else                    { $default = "$($cmbScene.SelectedItem) - Copy" }
+    if ($rdoRename.Checked) {
+        $default = [string]$cmbScene.SelectedItem
+        # A first scene that SE.Live shows as "<name> 1": offer a name that will stick.
+        if ($cmbScene.SelectedIndex -eq 0 -and (Get-FirstSceneClash (Get-CurrentCanvas) $default)) {
+            $default = Get-SafeFirstSceneName (Get-CurrentCanvas) $default
+        }
+    }
+    else { $default = "$($cmbScene.SelectedItem) - Copy" }
     if ($txtName.Text -eq $script:LastDefault -or [string]::IsNullOrWhiteSpace($txtName.Text)) {
         $txtName.Text = $default
     }
@@ -972,7 +1063,7 @@ $btnOk.Add_Click({
             $selected = [string]$cmbScene.SelectedItem
             if (-not (Confirm-Box "Delete scene '$selected' from canvas '$($canvas.Name)'?`n`nA backup is made first.")) { return }
             $res = Invoke-SceneDelete -Canvas $canvas -SceneName $selected
-            $msg = "Done! Scene '$selected' deleted.`n`nBackup of the previous state:`n$($res.Backup)"
+            $msg = "Done! Scene '$selected' deleted.`n`nBackup of the previous state:`n$($res.Backup)$($res.Note)"
         } else {
             $selected = [string]$cmbScene.SelectedItem
             $names    = Split-Names @($txtName.Text)

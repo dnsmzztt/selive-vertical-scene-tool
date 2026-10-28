@@ -30,20 +30,30 @@ Since SE.Live 26.x the canvas is also registered as a native OBS 33 canvas (you'
 
 Scenes created with **brand-new names survive reliably**. That's the foundation of the golden rules below. A detailed bug report for the SE.Live developers is included in this repo (`bug-report.md`).
 
-**On 26.9.4 (October 2026, five OBS restarts):**
+**On 26.9.4 (October 2026, six OBS restarts):**
 
 - Duplicated scenes load in the dock, keep their position in the list and survive SE.Live re-saving the file. Scenes deleted with the tool stay deleted.
 - Copies may reuse a name that also exists on the main canvas, even as the active scene: a vertical "Fortnite" next to the horizontal "Fortnite" stays "Fortnite".
-- **The first scene of the canvas is the exception.** Its name in the file "Valorant" was shown as "Valorant 1" after a restart, and renaming it back in the file never sticks. If the file already says "Valorant 1", it stays like that. SE.Live decides that name itself (same reconciliation as above, now adding " 1" instead of forcing "Scene 1"). The tool warns you, and you should rename the first scene from the dock.
 - Nothing about these names is stored on disk outside the composition file. SE.Live works them out again at every startup.
+
+### The " 1" bug (found in SE.Live's source code)
+
+SE.Live's plugin core is open source ([obs-streamelements-core](https://github.com/StreamElements/obs-streamelements-core)), and it has two different rules for scene names:
+
+- **Adding a scene** (`addScene` → `GetUniqueSceneName`): the name only has to be unique **within that canvas**.
+- **Renaming a scene** (`setScenePropertiesById` → `ObsSetUniqueSourceName` → `isSourceNameUnique`): the name must be unique **across all of OBS**. That means every scene and source of the main canvas, and every scene and scene entry of every SE.Live canvas. If it isn't, SE.Live silently appends " 1", " 2"...
+
+At startup the canvas is created with a placeholder scene called "Scene", and the dock restores the **first** scene through a rename (the other scenes are added). So a vertical first scene called "Valorant", on a setup that also has a horizontal "Valorant", always comes back as **"Valorant 1"**. Renaming it to "Valorant" from the dock fails for the same reason. Renaming it with the tool helps only if the name is unique.
+
+**Fix:** give the first scene a name used nowhere else in OBS, e.g. "Valorant - Vertical". Verified: after a restart it stays "Valorant - Vertical". The tool checks this for you. It refuses to give the first scene a name that would turn into "<name> 1" and suggests one that sticks. `-List` and the Rename window warn you when the current first scene has this problem. The same global rule applies to **any rename you do from the dock**.
 
 The `ptr(...)` ids in the file are just memory addresses of the last session: SE.Live reassigns all of them at every startup. The tool only has to keep them unique inside the file, which it does.
 
 ## Golden rules (read before using)
 
-1. **Leave the first scene's name to SE.Live.** It may show up as "Scene 1" or "<name> 1" and renames of it don't stick. Use it like any other scene, but rename it only from the dock, and never link it.
-2. **Always duplicate using brand-new names** — names never used before on that canvas (names from the main canvas are fine).
-3. **Avoid renaming scenes OBS has already seen.** The rename feature works at file level, but SE.Live may revert it. If you got a name wrong, duplicate with the right name instead and delete the old one.
+1. **The first scene needs a name used nowhere else in OBS** (e.g. "Valorant - Vertical"), otherwise it shows up as "<name> 1" — see "The \" 1\" bug" above. The tool enforces this.
+2. **Duplicate using names not already used on that canvas** (names from the main canvas are fine for every scene except the first).
+3. **Rename from the dock only to names used nowhere else in OBS**, or rename with the tool (OBS closed), which handles the rules for you.
 4. **Delete with the tool rather than from the dock.** Deleting scenes from the dock is what triggered the scene loss in our July testing. The tool's Delete (with OBS closed) cuts exactly that scene out of the file, after a backup, and refuses to delete the canvas's active scene.
 5. The tool makes a **timestamped backup before every change** — and can restore any of them in one click.
 
@@ -53,7 +63,7 @@ The `ptr(...)` ids in the file are just memory addresses of the last session: SE
 2. Auto-detects your composition files (or lets you browse to one — portable setups included)
 3. Four operations:
    - **Duplicate** — pick a scene and type one or more new names (one per line) to make several copies at once. Same sources, positions, crops, filters. The copies go right after the original, in the order you typed them (untick the box to append them at the end instead).
-   - **Rename** — see rules 1 and 3.
+   - **Rename** — for the first scene it checks the name against all of OBS and suggests one that sticks (rule 1).
    - **Delete** — removes one scene from the canvas (its sources stay in OBS). Not allowed on the active scene.
    - **Restore backup** — pick a backup by date (it shows which scenes it contains) and put it back. The current state is backed up first, so a restore can be undone too.
 4. Validates the result before writing — if anything looks wrong, the file is not touched:
