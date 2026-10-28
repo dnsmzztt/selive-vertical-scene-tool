@@ -2,8 +2,8 @@
 
 ## Environment
 
-- OBS Studio: latest stable as of July 2026 (64-bit, Windows 11)
-- SE.Live / obs-streamelements-core: latest available as of July 2026
+- First observed on: OBS Studio latest stable as of July 2026 + SE.Live latest available as of July 2026 (64-bit, Windows 11)
+- Still reproducible on: **OBS Studio 33.0.0 + SE.Live (obs-streamelements-core) 26.9.4.994**, October 2026 (64-bit, Windows 11)
 - Canvas: vertical 1080x1920, `isObsNativeComposition: false`, `view: "custom"`
 - Dual streaming Twitch (horizontal) + TikTok (vertical)
 

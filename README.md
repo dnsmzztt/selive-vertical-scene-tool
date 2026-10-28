@@ -2,7 +2,19 @@
 
 Duplicate (and rename) scenes on **SE.Live multistreaming canvases** (vertical canvas for TikTok, YouTube Shorts, etc.) — something the SE.Live dock still can't do.
 
-**v3.0** — updated for **SE.Live core 26.9.4 / OBS Studio 33.0** (October 2026).
+**v3.0** — built and tested for **SE.Live 26.9.4.994** on **OBS Studio 33.0.0** (Windows 11, October 2026).
+
+## Compatibility
+
+| | Version |
+| --- | --- |
+| SE.Live (obs-streamelements-core) | **26.9.4.994** — tested |
+| OBS Studio | **33.0.0** (64-bit) — tested |
+| Windows | 10 / 11 |
+
+Your SE.Live version is shown in the bottom-right corner of OBS's status bar (e.g. `SE.Live 26.9.4.994`). The tool reads it too: the window footer and `-List` say whether it is the tested version.
+
+On a different SE.Live version the tool still runs, but marks it as **not tested**. Before writing anything it checks that the composition file has the structure it knows: if an update changed the format, it stops without touching your files. Duplicates, deletes and the first-scene rename were verified in OBS on 26.9.4.994; everything else was tested on copies of a real 26.9.4.994 composition file. Older SE.Live builds were not re-tested with v3.
 
 ## The problem
 
@@ -30,7 +42,7 @@ Since SE.Live 26.x the canvas is also registered as a native OBS 33 canvas (you'
 
 Scenes created with **brand-new names survive reliably**. That's the foundation of the golden rules below. A detailed bug report for the SE.Live developers is included in this repo (`bug-report.md`).
 
-**On 26.9.4 (October 2026, six OBS restarts):**
+**On 26.9.4.994 (October 2026, six OBS restarts):**
 
 - Duplicated scenes load in the dock, keep their position in the list and survive SE.Live re-saving the file. Scenes deleted with the tool stay deleted.
 - Copies may reuse a name that also exists on the main canvas, even as the active scene: a vertical "Fortnite" next to the horizontal "Fortnite" stays "Fortnite".
@@ -118,6 +130,6 @@ Backups are never deleted by the tool; clean up old ones yourself when the folde
 
 ## Disclaimer
 
-Unofficial community tool, **not affiliated with StreamElements or the OBS Project**. The composition file format and the reconciliation behavior were reverse-engineered (SE.Live core 26.9.4 / OBS 33.0, October 2026) and may change in future updates — the tool checks the format and stops if it doesn't recognize it. A backup is always created before writing, but use at your own risk. License: MIT.
+Unofficial community tool, **not affiliated with StreamElements or the OBS Project**. The composition file format and the reconciliation behavior were reverse-engineered on SE.Live 26.9.4.994 / OBS Studio 33.0.0 (October 2026) and may change in future updates — the tool checks the format and stops if it doesn't recognize it. A backup is always created before writing, but use at your own risk. License: MIT.
 
 And please upvote the official feature request for native duplicate/clone — that, plus a fix for the behavior described in `bug-report.md`, is the real solution. This tool fills the gap until then.

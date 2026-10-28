@@ -25,8 +25,10 @@
     powershell -ExecutionPolicy Bypass -File .\SELive-Vertical-Scene-Tool.ps1 -NoGui -RestoreFrom "<file>.json.bak_20261028_111506188"
 
 .NOTES
-  Version 3.0 (surgical) - Unofficial community tool. Not affiliated with StreamElements
-  or the OBS Project. File format reverse-engineered (SE.Live core 26.9.4 / OBS 33.0, October 2026).
+  Version 3.0 (surgical) - built and tested for SE.Live 26.9.4.994 (obs-streamelements-core)
+  on OBS Studio 33.0.0, October 2026. Other SE.Live versions are flagged in the window, and the
+  tool stops if the composition file format is not the one it knows.
+  Unofficial community tool. Not affiliated with StreamElements or the OBS Project.
   A backup is always created before writing. Use at your own risk. License: MIT.
 #>
 param(
@@ -47,6 +49,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $script:ToolVersion  = '3.0'
 $script:TestedSELive = '26.9.4.994'
+$script:TestedObs    = '33.0.0'
 $script:PtrPattern   = 'ptr\([0-9A-Fa-f]{16}\)'
 $script:GuiMode      = -not ($NoGui -or $List)
 $script:ObsExe       = $null
@@ -833,7 +836,14 @@ $script:TakenCache  = @{}
 # ------------------------------------------------------------------ #
 if ($List) {
     if ((Get-ObsProcess).Count -gt 0) { Write-Host "(OBS is running: unsaved dock changes are not in the files yet)" -ForegroundColor Yellow }
-    if ($seVersion) { Write-Host "SE.Live core $seVersion (tool tested with $($script:TestedSELive))" }
+    Write-Host "SE.Live Scene Tool v$($script:ToolVersion) - built for SE.Live $($script:TestedSELive) on OBS $($script:TestedObs)"
+    if (-not $seVersion) {
+        Write-Host "Installed SE.Live version: not detected" -ForegroundColor Yellow
+    } elseif ($seVersion -eq $script:TestedSELive) {
+        Write-Host "Installed SE.Live version: $seVersion (the tested one)" -ForegroundColor Green
+    } else {
+        Write-Host "Installed SE.Live version: $seVersion - different from the tested $($script:TestedSELive): the format checks still protect your files" -ForegroundColor Yellow
+    }
     foreach ($c in $canvasList) {
         Write-Host ""
         Write-Host "Canvas '$($c.Name)'  ->  $($c.Path)" -ForegroundColor Cyan
@@ -899,7 +909,7 @@ if (-not $script:GuiMode) {
 #  6b. GUI mode                                                      #
 # ------------------------------------------------------------------ #
 $form                 = New-Object System.Windows.Forms.Form
-$form.Text            = "SE.Live Scene Tool v$($script:ToolVersion)"
+$form.Text            = "SE.Live Scene Tool v$($script:ToolVersion) - for SE.Live $($script:TestedSELive)"
 $form.ClientSize      = New-Object System.Drawing.Size(460, 400)
 $form.StartPosition   = 'CenterScreen'
 $form.FormBorderStyle = 'FixedDialog'
@@ -931,7 +941,7 @@ $txtName   = New-Control TextBox  15 169 430 66 $null
 $lblHint   = New-Control Label    15 240 430 54 ''
 $chkAfter   = New-Control CheckBox 15 300 430 22 'Place the copies right after the original (otherwise at the end)'
 $chkRestart = New-Control CheckBox 15 326 430 22 'Reopen OBS when done'
-$lblVersion = New-Control Label   15 367 220 18 ''
+$lblVersion = New-Control Label   15 356 235 36 ''
 $btnOk      = New-Control Button  255 360 92 28 'Duplicate'
 $btnCancel  = New-Control Button  353 360 92 28 'Cancel'
 
@@ -946,10 +956,15 @@ $chkAfter.Checked      = $true
 $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
 $form.CancelButton = $btnCancel
 
-$verText = "v$($script:ToolVersion)"
-if ($seVersion) {
-    $verText += " - SE.Live $seVersion"
-    if ($seVersion -ne $script:TestedSELive) { $verText += ' (untested)' }
+$verText = "Built for SE.Live $($script:TestedSELive)`n"
+if (-not $seVersion) {
+    $verText += 'Installed SE.Live: not detected'
+} elseif ($seVersion -eq $script:TestedSELive) {
+    $verText += "Installed SE.Live: $seVersion (tested)"
+    $lblVersion.ForeColor = [System.Drawing.Color]::SeaGreen
+} else {
+    $verText += "Installed SE.Live: $seVersion (not tested)"
+    $lblVersion.ForeColor = [System.Drawing.Color]::DarkOrange
 }
 $lblVersion.Text = $verText
 foreach ($c in $canvasList) { [void]$cmbCanvas.Items.Add($c.Name) }
