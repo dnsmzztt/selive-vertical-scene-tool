@@ -1,44 +1,56 @@
 <#
 .SYNOPSIS
-  SE.Live Vertical Canvas Scene Tool - duplicate and rename scenes on SE.Live
-  multistreaming canvases. v2 "surgical": it never rewrites the whole file, it only
+  SE.Live Vertical Canvas Scene Tool - duplicate, rename, delete and restore scenes on SE.Live
+  multistreaming canvases. v3 "surgical": it never rewrites the whole file, it only
   splices in (or touches) the bytes of the scene involved. Every other byte stays identical.
 
 .DESCRIPTION
   Double-click "SELive Scene Tool.bat" (same folder) and the tool:
     1. gracefully closes OBS if it is running (so SE.Live saves fresh state)
-    2. auto-detects your SE.Live "composition" files
-    3. lets you pick the operation (Duplicate / Rename), canvas, scene and new name
-    4. runs with an automatic backup and validation (if anything looks wrong, the file is NOT touched)
+    2. auto-detects your SE.Live "composition" files (or lets you browse to one)
+    3. lets you pick the operation (Duplicate / Rename / Delete / Restore backup), canvas, scene and new name(s)
+    4. runs with an automatic backup and deep validation (if anything looks wrong, the file is NOT touched)
     5. restarts OBS
 
-  IMPORTANT - read the README: SE.Live keeps a hidden scene registry of its own and
-  can fight external changes. Golden rules: treat the first scene as sacrificial,
-  always duplicate using brand-new names, avoid renaming scenes OBS has already seen.
+  IMPORTANT - read the README: SE.Live keeps scene state of its own and can fight
+  external changes. Golden rules: treat the first scene as sacrificial, always
+  duplicate using brand-new names, avoid renaming scenes OBS has already seen.
 
   Command-line usage (optional, no windows):
-    powershell -ExecutionPolicy Bypass -File .\SELive-Vertical-Scene-Tool.ps1 -NoGui -Scene "FF8 - Vertical" -NewName "Apex - Vertical"
+    powershell -ExecutionPolicy Bypass -File .\SELive-Vertical-Scene-Tool.ps1 -List
+    powershell -ExecutionPolicy Bypass -File .\SELive-Vertical-Scene-Tool.ps1 -NoGui -Scene "Valorant" -NewName "Apex"
+    powershell -ExecutionPolicy Bypass -File .\SELive-Vertical-Scene-Tool.ps1 -NoGui -Scene "Valorant" -NewName "Apex|Fortnite|Variety"
     powershell -ExecutionPolicy Bypass -File .\SELive-Vertical-Scene-Tool.ps1 -NoGui -Rename -Scene "Old Name" -NewName "New Name"
+    powershell -ExecutionPolicy Bypass -File .\SELive-Vertical-Scene-Tool.ps1 -NoGui -Delete -Scene "Old test"
+    powershell -ExecutionPolicy Bypass -File .\SELive-Vertical-Scene-Tool.ps1 -NoGui -RestoreFrom "<file>.json.bak_20261028_111506188"
 
 .NOTES
-  Version 2.0 (surgical) - Unofficial community tool. Not affiliated with StreamElements
-  or the OBS Project. File format reverse-engineered (SE.Live as of July 2026).
+  Version 3.0 (surgical) - Unofficial community tool. Not affiliated with StreamElements
+  or the OBS Project. File format reverse-engineered (SE.Live core 26.9.4 / OBS 33.0, October 2026).
   A backup is always created before writing. Use at your own risk. License: MIT.
 #>
 param(
     [string]$File,
+    [string]$Canvas,
     [string]$Scene,
-    [string]$NewName,
+    [string[]]$NewName,
     [switch]$Rename,
+    [switch]$Delete,
+    [switch]$AtEnd,
+    [string]$RestoreFrom,
+    [switch]$List,
     [switch]$NoGui,
     [switch]$NoRestart,
     [switch]$Force
 )
 
 $ErrorActionPreference = 'Stop'
-$script:GuiMode = -not $NoGui
-$script:ObsExe  = $null
-$script:Rng     = New-Object System.Random
+$script:ToolVersion  = '3.0'
+$script:TestedSELive = '26.9.4.994'
+$script:PtrPattern   = 'ptr\([0-9A-Fa-f]{16}\)'
+$script:GuiMode      = -not ($NoGui -or $List)
+$script:ObsExe       = $null
+$script:Rng          = New-Object System.Random
 
 if ($script:GuiMode) {
     Add-Type -AssemblyName System.Windows.Forms
@@ -62,86 +74,163 @@ function Show-InfoBox([string]$Msg) {
     } else { Write-Host $Msg -ForegroundColor Green }
 }
 
+function Confirm-Box([string]$Msg) {
+    $r = [System.Windows.Forms.MessageBox]::Show($Msg, 'SE.Live Scene Tool',
+        [System.Windows.Forms.MessageBoxButtons]::YesNo,
+        [System.Windows.Forms.MessageBoxIcon]::Question)
+    return ($r -eq [System.Windows.Forms.DialogResult]::Yes)
+}
+
 # ------------------------------------------------------------------ #
-#  1. If OBS is running: close it gracefully (or stop here)          #
+#  1. OBS process handling                                           #
 # ------------------------------------------------------------------ #
-$procs = @(Get-Process -Name obs64, obs32 -ErrorAction SilentlyContinue)
-if ($procs.Count -gt 0) {
-    $script:ObsExe = $procs[0].Path
-    if (-not $script:GuiMode) {
-        if (-not $Force) {
-            Show-ErrorBox "OBS is running. Close it first, or use the GUI mode which closes it for you."
-            exit 1
-        }
-    } else {
-        $risposta = [System.Windows.Forms.MessageBox]::Show(
-            "OBS is running and needs to be closed, because SE.Live only saves its scenes on shutdown.`n`nClose OBS gracefully now and reopen it when done?`n`n(If OBS shows a confirmation dialog on screen, answer it there.)",
-            'SE.Live Scene Tool',
-            [System.Windows.Forms.MessageBoxButtons]::YesNo,
-            [System.Windows.Forms.MessageBoxIcon]::Question)
-        if ($risposta -ne [System.Windows.Forms.DialogResult]::Yes) { exit 0 }
-    }
-    foreach ($p in $procs) {
-        if (-not $p.CloseMainWindow()) {
-            Show-ErrorBox "Could not close OBS automatically (it may be minimized to the tray). Close it manually and run the tool again."
-            exit 1
-        }
-    }
-    $limite = (Get-Date).AddSeconds(45)
-    while ((Get-Process -Name obs64, obs32 -ErrorAction SilentlyContinue) -and (Get-Date) -lt $limite) {
+function Get-ObsProcess { return @(Get-Process -Name obs64, obs32 -ErrorAction SilentlyContinue) }
+
+function Wait-ObsExit([int]$Seconds) {
+    $limite = (Get-Date).AddSeconds($Seconds)
+    while ((Get-ObsProcess).Count -gt 0 -and (Get-Date) -lt $limite) {
         Start-Sleep -Milliseconds 500
     }
-    if (Get-Process -Name obs64, obs32 -ErrorAction SilentlyContinue) {
-        Show-ErrorBox "OBS did not close within 45 seconds (check for an open confirmation dialog). Close it manually and run the tool again."
-        exit 1
+    return ((Get-ObsProcess).Count -eq 0)
+}
+
+function Close-Obs {
+    $procs = Get-ObsProcess
+    if ($procs[0].Path) { $script:ObsExe = $procs[0].Path }
+    # An OBS started "as administrator" hides its path from us, and Windows blocks a normal
+    # process from closing an elevated one: in that case only the user can close it.
+    $elevated = @($procs | Where-Object { -not $_.Path }).Count -gt 0
+    if (-not $elevated) {
+        foreach ($p in $procs) {
+            if (-not $p.CloseMainWindow()) {
+                # Main window hidden (minimized to tray): a plain taskkill still asks it to close gracefully.
+                & taskkill.exe /PID $p.Id 2>&1 | Out-Null
+            }
+        }
+        if (Wait-ObsExit 45) { return }
     }
-    Start-Sleep -Seconds 2   # give SE.Live a moment to finish writing
+    if ($elevated) { $why = "OBS is running as administrator, so Windows does not let this tool close it." }
+    else           { $why = "OBS did not close within 45 seconds (maybe a confirmation dialog is open)." }
+    if (-not $script:GuiMode) { throw "$why Close OBS yourself (File > Exit) and run the tool again." }
+    while ($true) {
+        $r = [System.Windows.Forms.MessageBox]::Show(
+            "$why`n`nClose OBS yourself (File > Exit), then press OK.",
+            'SE.Live Scene Tool',
+            [System.Windows.Forms.MessageBoxButtons]::OKCancel,
+            [System.Windows.Forms.MessageBoxIcon]::Information)
+        if ($r -ne [System.Windows.Forms.DialogResult]::OK) { exit 0 }
+        if (Wait-ObsExit 15) { return }
+    }
+}
+
+function Wait-FilesSettled([string]$Dir) {
+    # SE.Live writes its compositions while OBS shuts down: wait until nothing in the folder changes anymore.
+    Start-Sleep -Seconds 1
+    $prev = $null
+    for ($k = 0; $k -lt 20; $k++) {
+        $sig = (Get-ChildItem -LiteralPath $Dir -Filter '*.json' -File -ErrorAction SilentlyContinue |
+                ForEach-Object { "$($_.Name)|$($_.Length)|$($_.LastWriteTimeUtc.Ticks)" }) -join ';'
+        if ($sig -eq $prev) { return }
+        $prev = $sig
+        Start-Sleep -Milliseconds 750
+    }
+}
+
+function Get-ObsExePath {
+    if ($script:ObsExe -and (Test-Path -LiteralPath $script:ObsExe)) { return $script:ObsExe }
+    $cands = @()
+    foreach ($key in @('HKLM:\SOFTWARE\OBS Studio', 'HKLM:\SOFTWARE\WOW6432Node\OBS Studio')) {
+        $reg = Get-ItemProperty -LiteralPath $key -ErrorAction SilentlyContinue
+        if ($reg -and $reg.'(default)') { $cands += (Join-Path $reg.'(default)' 'bin\64bit\obs64.exe') }
+    }
+    $cands += "$env:ProgramFiles\obs-studio\bin\64bit\obs64.exe"
+    $cands += "${env:ProgramFiles(x86)}\obs-studio\bin\64bit\obs64.exe"
+    foreach ($c in $cands) { if ($c -and (Test-Path -LiteralPath $c)) { return $c } }
+    return $null
+}
+
+function Start-Obs {
+    $exe = Get-ObsExePath
+    if ($exe) {
+        Start-Process -FilePath $exe -WorkingDirectory (Split-Path -Path $exe -Parent)
+        return $true
+    }
+    return $false
 }
 
 # ------------------------------------------------------------------ #
 #  2. Raw read/write and composition file discovery                  #
 # ------------------------------------------------------------------ #
-function Read-Composition([string]$Path) {
-    $bytes  = [System.IO.File]::ReadAllBytes($Path)
-    $hasBom = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
-    $offset = 0; if ($hasBom) { $offset = 3 }
-    $text   = [System.Text.Encoding]::UTF8.GetString($bytes, $offset, $bytes.Length - $offset)
-    return [pscustomobject]@{ Text = $text; HasBom = $hasBom }
-}
-
-function Write-Composition([string]$Path, [string]$Text, [bool]$HasBom) {
-    [System.IO.File]::WriteAllText($Path, $Text, (New-Object System.Text.UTF8Encoding($HasBom)))
-}
-
-if ($File) {
-    if (-not (Test-Path -LiteralPath $File)) { Show-ErrorBox "File not found: $File"; exit 1 }
-    $percorsi = @(Get-Item -LiteralPath $File)
-} else {
+function Get-CompositionDir {
     $dir = $env:APPDATA
     foreach ($seg in @('obs-studio','plugin_config','obs-streamelements-core','scoped_config_storage','streamelements_multi-streaming','compositions')) {
         $dir = Join-Path $dir $seg
     }
-    $percorsi = @(Get-ChildItem -LiteralPath $dir -Filter '*.json' -File -ErrorAction SilentlyContinue)
-    if ($percorsi.Count -eq 0) {
-        Show-ErrorBox "No composition files found in:`n$dir`n`nIs SE.Live installed, and have you created at least one canvas?"
-        exit 1
-    }
+    return $dir
 }
 
-$canvasList = @()
-foreach ($f in $percorsi) {
+function Get-SELiveVersion([string]$CompositionPath) {
+    # compositions -> streamelements_multi-streaming -> scoped_config_storage -> obs-streamelements-core
     try {
-        $comp = Read-Composition $f.FullName
-        $dati = ConvertFrom-Json -InputObject $comp.Text
-        if ($dati.scenes) {
-            $nome = if ($dati.name) { [string]$dati.name } else { $f.BaseName }
-            $canvasList += [pscustomobject]@{ Name = $nome; Path = $f.FullName; Dati = $dati; Testo = $comp.Text; HasBom = $comp.HasBom }
+        $root = Split-Path (Split-Path (Split-Path (Split-Path $CompositionPath -Parent) -Parent) -Parent) -Parent
+        $ini  = Join-Path $root 'obs-streamelements-core.ini'
+        $m = Select-String -LiteralPath $ini -Pattern '^Version=(\d{4})(\d{2})(\d{2})(\d{6})\s*$' -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($m) {
+            $g = $m.Matches[0].Groups
+            return ('{0}.{1}.{2}.{3}' -f ([int]$g[1].Value % 100), [int]$g[2].Value, [int]$g[3].Value, [int]$g[4].Value)
         }
     } catch { }
+    return $null
 }
-if ($canvasList.Count -eq 0) {
-    Show-ErrorBox "Found some files, but none contain scenes in a recognizable format. If SE.Live changed its file format, this tool may need an update."
-    exit 1
+
+function Read-Composition([string]$Path) {
+    $item   = Get-Item -LiteralPath $Path
+    $bytes  = [System.IO.File]::ReadAllBytes($Path)
+    $hasBom = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
+    $offset = 0; if ($hasBom) { $offset = 3 }
+    $text   = (New-Object System.Text.UTF8Encoding($false, $true)).GetString($bytes, $offset, $bytes.Length - $offset)
+    return [pscustomobject]@{ Text = $text; HasBom = $hasBom; Stamp = $item.LastWriteTimeUtc; Length = $item.Length }
+}
+
+function Write-Composition([string]$Path, [string]$Text, [bool]$HasBom) {
+    # Write next to the original, then swap it in: a crash mid-write can never leave a half-written composition.
+    $tmp = "$Path.tmp_$PID"
+    [System.IO.File]::WriteAllText($tmp, $Text, (New-Object System.Text.UTF8Encoding($HasBom)))
+    [System.IO.File]::Replace($tmp, $Path, [NullString]::Value)
+}
+
+function Get-SceneList($Parsed) { return @(@($Parsed.scenes) | Where-Object { $null -ne $_ }) }
+
+function Test-CompositionFormat($Parsed) {
+    # Returns $null when the file looks like the format this tool was built for, otherwise the reason.
+    if (-not $Parsed.PSObject.Properties['scenes']) { return "no 'scenes' list" }
+    foreach ($s in (Get-SceneList $Parsed)) {
+        if (-not ([string]$s.id -match "^$($script:PtrPattern)$")) { return "a scene id is not in the expected ptr(...) format" }
+        if (-not ($s.name -is [string]))                         { return "a scene has no name" }
+        if (-not $s.PSObject.Properties['active'])                { return "scene '$($s.name)' has no 'active' flag" }
+        foreach ($src in @(@($s.sources) | Where-Object { $null -ne $_ })) {
+            if (-not ([string]$src.id -match "^$($script:PtrPattern)$")) { return "source '$($src.name)' in scene '$($s.name)' has an unexpected id" }
+        }
+    }
+    return $null
+}
+
+function Get-Canvases([object[]]$Files) {
+    $list = @()
+    foreach ($f in $Files) {
+        try {
+            $comp = Read-Composition $f.FullName
+            $dati = ConvertFrom-Json -InputObject $comp.Text
+            if ($dati.PSObject.Properties['scenes']) {
+                $nome = if ($dati.name) { [string]$dati.name } else { $f.BaseName }
+                $list += [pscustomobject]@{
+                    Name = $nome; Path = $f.FullName; Dati = $dati; Testo = $comp.Text; HasBom = $comp.HasBom
+                    Stamp = $comp.Stamp; Length = $comp.Length; FormatIssue = (Test-CompositionFormat $dati)
+                }
+            }
+        } catch { }
+    }
+    return ,$list
 }
 
 # ------------------------------------------------------------------ #
@@ -283,22 +372,237 @@ function Update-Span([string]$Text, $Span, [string]$New) {
 }
 
 function Find-SceneIndex($Parsed, [string]$SceneName) {
+    $scenes = Get-SceneList $Parsed
     $idx = -1
-    for ($k = 0; $k -lt @($Parsed.scenes).Count; $k++) {
-        if ($Parsed.scenes[$k].name -eq $SceneName) {
+    for ($k = 0; $k -lt $scenes.Count; $k++) {
+        if ($scenes[$k].name -ceq $SceneName) {
             if ($idx -ge 0) { throw "More than one scene is named '$SceneName'." }
             $idx = $k
         }
     }
-    if ($idx -lt 0) { throw ("Scene '{0}' not found. Available scenes: {1}" -f $SceneName, ((@($Parsed.scenes) | ForEach-Object { $_.name }) -join ', ')) }
+    if ($idx -lt 0) { throw ("Scene '{0}' not found. Available scenes: {1}" -f $SceneName, (($scenes | ForEach-Object { $_.name }) -join ', ')) }
     return $idx
 }
 
+function Assert-ValidNewName($Parsed, [string]$TargetName, [string]$Except) {
+    if ([string]::IsNullOrWhiteSpace($TargetName)) { throw "The new scene name is empty." }
+    if ($TargetName -ne $TargetName.Trim()) { throw "The name '$TargetName' starts or ends with spaces." }
+    if ($TargetName -match '[\x00-\x1F]') { throw "The name '$TargetName' contains control characters." }
+    $clash = @(Get-SceneList $Parsed | Where-Object { $_.name -eq $TargetName -and $_.name -cne $Except })
+    if ($clash.Count -gt 0) { throw "A scene named '$($clash[0].name)' already exists on this canvas (names are compared ignoring case)." }
+}
+
+# The identities a scene owns: the scene itself and its entries (one per source in the scene).
+# Filters are deliberately left out: they belong to the underlying source, which scenes share,
+# so SE.Live itself writes the same filter id in every scene that uses that source.
+function Get-OwnedIds($Scene) {
+    $ids = New-Object System.Collections.ArrayList
+    [void]$ids.Add([string]$Scene.id)
+    foreach ($src in @(@($Scene.sources) | Where-Object { $null -ne $_ })) { [void]$ids.Add([string]$src.id) }
+    return ,$ids
+}
+
+# Problems are keyed by ids (not names), so a problem SE.Live itself left in the file is not
+# mistaken for a new one after a rename.
+function Get-IntegrityProblems($Parsed) {
+    $problems = New-Object System.Collections.Generic.List[string]
+    $owner = @{}
+    foreach ($s in (Get-SceneList $Parsed)) {
+        foreach ($id in (Get-OwnedIds $s)) {
+            if ($owner.ContainsKey($id)) { $problems.Add("id $id is used twice") }
+            else { $owner[$id] = $true }
+        }
+        foreach ($src in @(@($s.sources) | Where-Object { $null -ne $_ })) {
+            if ($src.PSObject.Properties['sceneId'] -and $src.sceneId -ne $s.id) {
+                $problems.Add("entry $($src.id) points to another scene")
+            }
+            if ($Parsed.id -and $src.PSObject.Properties['videoCompositionId'] -and $src.videoCompositionId -ne $Parsed.id) {
+                $problems.Add("entry $($src.id) belongs to another canvas")
+            }
+        }
+        if ($Parsed.id -and $s.PSObject.Properties['videoCompositionId'] -and $s.videoCompositionId -ne $Parsed.id) {
+            $problems.Add("scene $($s.id) belongs to another canvas")
+        }
+    }
+    $names = @{}
+    foreach ($s in (Get-SceneList $Parsed)) {
+        $k = ([string]$s.name).ToLowerInvariant()
+        if ($names.ContainsKey($k)) { $problems.Add("scene name '$($s.name)' is used twice") } else { $names[$k] = $true }
+    }
+    return ,$problems
+}
+
+function Assert-NoNewProblems($Before, $AfterParsed) {
+    $new = @(foreach ($p in (Get-IntegrityProblems $AfterParsed)) { if ($Before -notcontains $p) { $p } })
+    if ($new.Count -gt 0) { throw ("Validation failed, operation aborted, file untouched:`n  - " + ($new -join "`n  - ")) }
+}
+
+function Get-PtrPrefix([string]$Id) {
+    if ($Id -match '^ptr\(([0-9A-Fa-f]{8})[0-9A-Fa-f]{8}\)$') { return $Matches[1].ToUpperInvariant() }
+    return '0000026E'
+}
+
+function New-UniquePtr($Used, [string]$Prefix) {
+    while ($true) {
+        # 16-byte aligned, like the real heap addresses SE.Live writes
+        $low  = [long]$script:Rng.Next(0x100000, 0x10000000) * 16
+        $cand = 'ptr({0}{1:X8})' -f $Prefix, $low
+        if ($Used.Add($cand)) { return $cand }
+    }
+}
+
+function ConvertTo-Canonical($Value) { return (ConvertTo-Json -InputObject $Value -Depth 64 -Compress) }
+
+# Without -AfterScene the copy is appended at the end of the list, otherwise it goes right after that scene.
+function Copy-SceneInText([string]$Text, [string]$SceneName, [string]$TargetName, [string]$AfterScene) {
+    $parsed = ConvertFrom-Json -InputObject $Text
+    $scenes = Get-SceneList $parsed
+    $idx    = Find-SceneIndex $parsed $SceneName
+    Assert-ValidNewName $parsed $TargetName $null
+    $before = Get-IntegrityProblems $parsed
+
+    $layout = Get-SceneSpans $Text
+    if (@($layout.Spans).Count -ne $scenes.Count) { throw "Internal inconsistency while reading the file: operation aborted, file untouched." }
+    if ($AfterScene) {
+        $afterIdx = Find-SceneIndex $parsed $AfterScene
+        $insertAt = $layout.Spans[$afterIdx].End + 1
+        $copyIdx  = $afterIdx + 1
+    } else {
+        $insertAt = $layout.ArrayEnd
+        $copyIdx  = $scenes.Count
+    }
+    $span = $layout.Spans[$idx]
+    $sceneText = $Text.Substring($span.Start, $span.End - $span.Start + 1)
+
+    $kv = Get-KeyValueSpans $sceneText
+    $edits = @(
+        [pscustomobject]@{ Span = $kv['name'];   New = '"' + (ConvertTo-JsonEscaped $TargetName) + '"' },
+        [pscustomobject]@{ Span = $kv['active']; New = 'false' }
+    ) | Sort-Object { $_.Span.Start } -Descending
+    foreach ($e in $edits) { $sceneText = Update-Span $sceneText $e.Span $e.New }
+
+    # Fresh identity for the scene and its entries; every occurrence is remapped, so the entries'
+    # 'sceneId' back-references follow the new scene id automatically. Filter ids stay shared (see Get-OwnedIds).
+    $used = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($m in [regex]::Matches($Text, $script:PtrPattern)) { [void]$used.Add($m.Value) }
+    $owned = Get-OwnedIds $scenes[$idx]
+    $prefix = Get-PtrPrefix ([string]$scenes[$idx].id)
+    $map = @{}; $reverse = @{}
+    foreach ($id in $owned) {
+        if (-not $map.ContainsKey($id)) { $map[$id] = New-UniquePtr $used $prefix; $reverse[$map[$id]] = $id }
+    }
+    $sceneText = [regex]::Replace($sceneText, $script:PtrPattern, [System.Text.RegularExpressions.MatchEvaluator]{
+        param($m) if ($map.ContainsKey($m.Value)) { $map[$m.Value] } else { $m.Value }
+    })
+
+    $newText = $Text.Insert($insertAt, ',' + $sceneText)
+
+    # --- validation: nothing outside the splice moved, the copy is a faithful clone, ids are all unique ---
+    if (-not ($newText.StartsWith($Text.Substring(0, $insertAt), [System.StringComparison]::Ordinal) -and
+              $newText.EndsWith($Text.Substring($insertAt), [System.StringComparison]::Ordinal))) {
+        throw "Validation failed (bytes outside the new scene changed): operation aborted, file untouched."
+    }
+    $check     = ConvertFrom-Json -InputObject $newText
+    $newScenes = Get-SceneList $check
+    if ($newScenes.Count -ne ($scenes.Count + 1)) { throw "Validation failed (scene count): operation aborted, file untouched." }
+    $copy = $newScenes[$copyIdx]
+    if ($copy.name -cne $TargetName -or $copy.active -ne $false) { throw "Validation failed (name/active of the copy): operation aborted, file untouched." }
+    $copySources = [regex]::Replace((ConvertTo-Canonical @($copy.sources)), $script:PtrPattern, [System.Text.RegularExpressions.MatchEvaluator]{
+        param($m) if ($reverse.ContainsKey($m.Value)) { $reverse[$m.Value] } else { $m.Value }
+    })
+    if ($copySources -cne (ConvertTo-Canonical @($scenes[$idx].sources))) {
+        throw "Validation failed (the copy differs from the original): operation aborted, file untouched."
+    }
+    Assert-NoNewProblems $before $check
+    return $newText
+}
+
+function Rename-SceneInText([string]$Text, [string]$SceneName, [string]$TargetName) {
+    $parsed = ConvertFrom-Json -InputObject $Text
+    $scenes = Get-SceneList $parsed
+    $idx    = Find-SceneIndex $parsed $SceneName
+    if ($TargetName -ceq $SceneName) { throw "The new name is identical to the current one." }
+    Assert-ValidNewName $parsed $TargetName $SceneName
+    $before = Get-IntegrityProblems $parsed
+
+    $layout = Get-SceneSpans $Text
+    if (@($layout.Spans).Count -ne $scenes.Count) { throw "Internal inconsistency while reading the file: operation aborted, file untouched." }
+    $span = $layout.Spans[$idx]
+    $kv = Get-KeyValueSpans ($Text.Substring($span.Start, $span.End - $span.Start + 1))
+    $absStart = $span.Start + $kv['name'].Start
+    $absLen   = $kv['name'].End - $kv['name'].Start + 1
+    $newText  = $Text.Remove($absStart, $absLen).Insert($absStart, '"' + (ConvertTo-JsonEscaped $TargetName) + '"')
+
+    $check     = ConvertFrom-Json -InputObject $newText
+    $newScenes = Get-SceneList $check
+    if ($newScenes.Count -ne $scenes.Count -or $newScenes[$idx].name -cne $TargetName -or $newScenes[$idx].id -ne $scenes[$idx].id) {
+        throw "Validation failed: operation aborted, file untouched."
+    }
+    Assert-NoNewProblems $before $check
+    return $newText
+}
+
+function Remove-SceneInText([string]$Text, [string]$SceneName) {
+    $parsed = ConvertFrom-Json -InputObject $Text
+    $scenes = Get-SceneList $parsed
+    $idx    = Find-SceneIndex $parsed $SceneName
+    if ($scenes.Count -le 1) { throw "'$SceneName' is the only scene of this canvas: it cannot be deleted." }
+    if ($scenes[$idx].active) { throw "'$SceneName' is the active scene of the canvas. Switch the canvas to another scene in OBS first, then delete it." }
+    $before = Get-IntegrityProblems $parsed
+
+    $layout = Get-SceneSpans $Text
+    if (@($layout.Spans).Count -ne $scenes.Count) { throw "Internal inconsistency while reading the file: operation aborted, file untouched." }
+    # Cut the scene together with one separating comma: the one after it, or the one before it if it is the last.
+    if ($idx -lt $scenes.Count - 1) { $from = $layout.Spans[$idx].Start;         $to = $layout.Spans[$idx + 1].Start - 1 }
+    else                            { $from = $layout.Spans[$idx - 1].End + 1;   $to = $layout.Spans[$idx].End }
+    $newText = $Text.Remove($from, $to - $from + 1)
+
+    $check     = ConvertFrom-Json -InputObject $newText
+    $expected  = @($scenes | Where-Object { $_.id -ne $scenes[$idx].id } | ForEach-Object { [string]$_.name })
+    $remaining = @(Get-SceneList $check | ForEach-Object { [string]$_.name })
+    if (($remaining -join "`n") -cne ($expected -join "`n")) { throw "Validation failed: operation aborted, file untouched." }
+    Assert-NoNewProblems $before $check
+    return $newText
+}
+
+# ------------------------------------------------------------------ #
+#  4. Operations (backup + safe write)                               #
+# ------------------------------------------------------------------ #
 function New-BackupFile($Canvas) {
     $stamp  = Get-Date -Format 'yyyyMMdd_HHmmssfff'
     $backup = "$($Canvas.Path).bak_$stamp"
     Copy-Item -LiteralPath $Canvas.Path -Destination $backup
     return $backup
+}
+
+function Assert-SafeToWrite($Canvas) {
+    if ((Get-ObsProcess).Count -gt 0) {
+        throw "OBS is running again: SE.Live would overwrite the change when it closes. Close OBS and retry."
+    }
+    $now = Get-Item -LiteralPath $Canvas.Path
+    if ($now.LastWriteTimeUtc -ne $Canvas.Stamp -or $now.Length -ne $Canvas.Length) {
+        throw "The composition file changed after the tool read it (was OBS reopened?). Run the tool again so it works on the latest version."
+    }
+}
+
+function Save-Composition($Canvas, [string]$NewText) {
+    Assert-SafeToWrite $Canvas
+    $backup = New-BackupFile $Canvas
+    Write-Composition $Canvas.Path $NewText $Canvas.HasBom
+    $back = Read-Composition $Canvas.Path
+    if ($back.Text -cne $NewText) {
+        Copy-Item -LiteralPath $backup -Destination $Canvas.Path -Force
+        throw "Read-back check failed: the original file has been put back from the backup."
+    }
+    $Canvas.Testo = $back.Text; $Canvas.Dati = ConvertFrom-Json -InputObject $back.Text
+    $Canvas.Stamp = $back.Stamp; $Canvas.Length = $back.Length
+    return $backup
+}
+
+function Assert-CanvasUsable($Canvas) {
+    if ($Canvas.FormatIssue) {
+        throw "This canvas file is not in the format the tool knows ($($Canvas.FormatIssue)). SE.Live probably changed its file format: the tool needs an update. Nothing was changed."
+    }
 }
 
 function Find-NameReferences($Canvas, [string]$Name) {
@@ -318,86 +622,77 @@ function Find-NameReferences($Canvas, [string]$Name) {
     return ,$hits
 }
 
-function Invoke-SceneDuplicate($Canvas, [string]$SceneName, [string]$TargetName) {
-    $parsed = $Canvas.Dati
-    $idx = Find-SceneIndex $parsed $SceneName
-    if ([string]::IsNullOrWhiteSpace($TargetName)) { throw "The name of the copy is empty." }
-    if (@(@($parsed.scenes) | Where-Object { $_.name -eq $TargetName }).Count -gt 0) { throw "A scene named '$TargetName' already exists." }
+function Split-Names([string[]]$Names) {
+    return ,@($Names | ForEach-Object { $_ -split "\||`r?`n" } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+}
 
-    $layout = Get-SceneSpans $Canvas.Testo
-    if (@($layout.Spans).Count -ne @($parsed.scenes).Count) { throw "Internal inconsistency while reading the file: operation aborted, file untouched." }
-    $span = $layout.Spans[$idx]
-    $sceneText = $Canvas.Testo.Substring($span.Start, $span.End - $span.Start + 1)
-
-    $kv = Get-KeyValueSpans $sceneText
-    $edits = @(
-        [pscustomobject]@{ Span = $kv['name'];   New = '"' + (ConvertTo-JsonEscaped $TargetName) + '"' },
-        [pscustomobject]@{ Span = $kv['active']; New = 'false' }
-    ) | Sort-Object { $_.Span.Start } -Descending
-    foreach ($e in $edits) { $sceneText = Update-Span $sceneText $e.Span $e.New }
-
-    $used = New-Object 'System.Collections.Generic.HashSet[string]'
-    foreach ($m in [regex]::Matches($Canvas.Testo, 'ptr\([0-9A-Fa-f]{16}\)')) { [void]$used.Add($m.Value) }
-    $newPtr = {
-        while ($true) {
-            $sfx = ''
-            for ($q = 0; $q -lt 8; $q++) { $sfx += '{0:X}' -f $script:Rng.Next(0, 16) }
-            $cand = "ptr(0000018E$sfx)"
-            if (-not $used.Contains($cand)) { [void]$used.Add($cand); return $cand }
-        }
+function Invoke-SceneDuplicate($Canvas, [string]$SceneName, [string[]]$TargetNames, [bool]$AfterOriginal = $true) {
+    Assert-CanvasUsable $Canvas
+    if ($TargetNames.Count -eq 0) { throw "Type at least one name for the copy." }
+    $seen = @{}
+    foreach ($t in $TargetNames) {
+        if ($seen.ContainsKey($t.ToLowerInvariant())) { throw "The name '$t' is in the list twice." }
+        $seen[$t.ToLowerInvariant()] = $true
     }
-    $sceneText = $sceneText.Replace([string]$parsed.scenes[$idx].id, (& $newPtr))
-    foreach ($src in @($parsed.scenes[$idx].sources)) {
-        $sceneText = $sceneText.Replace([string]$src.id, (& $newPtr))
+    $text = $Canvas.Testo
+    # Each copy goes after the previous one, so a batch keeps the order it was typed in.
+    $anchor = if ($AfterOriginal) { $SceneName } else { $null }
+    foreach ($t in $TargetNames) {
+        $text = Copy-SceneInText $text $SceneName $t $anchor
+        if ($AfterOriginal) { $anchor = $t }
     }
-
-    $newText = $Canvas.Testo.Insert($layout.ArrayEnd, ',' + $sceneText)
-
-    $check = ConvertFrom-Json -InputObject $newText
-    if (@($check.scenes).Count -ne (@($parsed.scenes).Count + 1)) { throw "Validation failed: operation aborted, file untouched." }
-
-    $backup = New-BackupFile $Canvas
-    Write-Composition $Canvas.Path $newText $Canvas.HasBom
-    return [pscustomobject]@{ Backup = $backup; Warnings = @() }
+    return [pscustomobject]@{ Backup = (Save-Composition $Canvas $text); Warnings = @() }
 }
 
 function Invoke-SceneRename($Canvas, [string]$SceneName, [string]$TargetName) {
-    $parsed = $Canvas.Dati
-    $idx = Find-SceneIndex $parsed $SceneName
-    if ([string]::IsNullOrWhiteSpace($TargetName)) { throw "The new name is empty." }
-    if ($TargetName -ceq $SceneName) { throw "The new name is identical to the current one." }
-    if (@(@($parsed.scenes) | Where-Object { $_.name -eq $TargetName -and $_.name -cne $SceneName }).Count -gt 0) { throw "Another scene named '$TargetName' already exists." }
-
-    $layout = Get-SceneSpans $Canvas.Testo
-    if (@($layout.Spans).Count -ne @($parsed.scenes).Count) { throw "Internal inconsistency while reading the file: operation aborted, file untouched." }
-    $span = $layout.Spans[$idx]
-    $sceneText = $Canvas.Testo.Substring($span.Start, $span.End - $span.Start + 1)
-    $kv = Get-KeyValueSpans $sceneText
-    $absStart = $span.Start + $kv['name'].Start
-    $absLen   = $kv['name'].End - $kv['name'].Start + 1
-    $newText  = $Canvas.Testo.Remove($absStart, $absLen).Insert($absStart, '"' + (ConvertTo-JsonEscaped $TargetName) + '"')
-
-    $check = ConvertFrom-Json -InputObject $newText
-    if (@($check.scenes).Count -ne @($parsed.scenes).Count) { throw "Validation failed: operation aborted, file untouched." }
-
-    $backup = New-BackupFile $Canvas
-    Write-Composition $Canvas.Path $newText $Canvas.HasBom
-    return [pscustomobject]@{ Backup = $backup; Warnings = (Find-NameReferences $Canvas $SceneName) }
+    Assert-CanvasUsable $Canvas
+    $isFirst = (Find-SceneIndex $Canvas.Dati $SceneName) -eq 0
+    $text = Rename-SceneInText $Canvas.Testo $SceneName $TargetName
+    $backup = Save-Composition $Canvas $text
+    $note = ''
+    if ($isFirst) { $note = "`n`nNOTE: this is the first scene of the canvas. SE.Live decides that name by itself and will likely keep showing the old one: rename it from the SE.Live dock instead." }
+    return [pscustomobject]@{ Backup = $backup; Warnings = (Find-NameReferences $Canvas $SceneName); Note = $note }
 }
 
-function Start-Obs {
-    $exe = $script:ObsExe
-    if (-not $exe -or -not (Test-Path -LiteralPath $exe)) {
-        foreach ($cand in @("$env:ProgramFiles\obs-studio\bin\64bit\obs64.exe",
-                            "${env:ProgramFiles(x86)}\obs-studio\bin\64bit\obs64.exe")) {
-            if ($cand -and (Test-Path -LiteralPath $cand)) { $exe = $cand; break }
+function Invoke-SceneDelete($Canvas, [string]$SceneName) {
+    Assert-CanvasUsable $Canvas
+    $text = Remove-SceneInText $Canvas.Testo $SceneName
+    return [pscustomobject]@{ Backup = (Save-Composition $Canvas $text); Warnings = @() }
+}
+
+function Get-Backups($Canvas) {
+    $dir  = Split-Path -Path $Canvas.Path -Parent
+    $leaf = Split-Path -Path $Canvas.Path -Leaf
+    $items = @()
+    foreach ($f in @(Get-ChildItem -LiteralPath $dir -Filter "$leaf.bak_*" -File -ErrorAction SilentlyContinue | Sort-Object Name -Descending)) {
+        $when = $f.LastWriteTime
+        if ($f.Name -match '\.bak_(\d{8}_\d{6})') {
+            $when = [datetime]::ParseExact($Matches[1], 'yyyyMMdd_HHmmss', [System.Globalization.CultureInfo]::InvariantCulture)
         }
+        $scenes = $null
+        try { $scenes = @(Get-SceneList (ConvertFrom-Json -InputObject (Read-Composition $f.FullName).Text) | ForEach-Object { [string]$_.name }) } catch { }
+        $items += [pscustomobject]@{ Path = $f.FullName; When = $when; Scenes = $scenes }
     }
-    if ($exe -and (Test-Path -LiteralPath $exe)) {
-        Start-Process -FilePath $exe -WorkingDirectory (Split-Path -Path $exe -Parent)
-        return $true
-    }
-    return $false
+    return ,$items
+}
+
+function Format-Backup($b) {
+    $what = if ($null -eq $b.Scenes) { 'unreadable' } else { '{0} scenes' -f $b.Scenes.Count }
+    return ('{0:yyyy-MM-dd HH:mm:ss}  ({1})' -f $b.When, $what)
+}
+
+function Invoke-BackupRestore($Canvas, [string]$BackupPath) {
+    if (-not (Test-Path -LiteralPath $BackupPath)) { throw "Backup not found: $BackupPath" }
+    $bk = Read-Composition $BackupPath
+    $bkData = ConvertFrom-Json -InputObject $bk.Text
+    if (-not $bkData.PSObject.Properties['scenes']) { throw "That file is not a valid composition backup." }
+    if ($Canvas.Dati.id -and $bkData.id -and $bkData.id -ne $Canvas.Dati.id) { throw "That backup belongs to a different canvas." }
+    Assert-SafeToWrite $Canvas
+    $backup = New-BackupFile $Canvas   # the current state stays restorable too
+    $tmp = "$($Canvas.Path).tmp_$PID"
+    Copy-Item -LiteralPath $BackupPath -Destination $tmp -Force
+    [System.IO.File]::Replace($tmp, $Canvas.Path, [NullString]::Value)
+    return [pscustomobject]@{ Backup = $backup; Scenes = @(Get-SceneList $bkData | ForEach-Object { [string]$_.name }) }
 }
 
 function Format-Warnings($Warnings) {
@@ -407,29 +702,108 @@ function Format-Warnings($Warnings) {
 }
 
 # ------------------------------------------------------------------ #
-#  4a. Command-line mode                                             #
+#  5. Startup: close OBS, find the canvases                          #
 # ------------------------------------------------------------------ #
+if ($File) {
+    if (-not (Test-Path -LiteralPath $File)) { Show-ErrorBox "File not found: $File"; exit 1 }
+    $File = (Resolve-Path -LiteralPath $File).ProviderPath
+    $compDir = Split-Path -Path $File -Parent
+} else {
+    $compDir = Get-CompositionDir
+}
+
+if (-not $List -and (Get-ObsProcess).Count -gt 0) {
+    if (-not $script:GuiMode -and -not $Force) {
+        Show-ErrorBox "OBS is running. Close it first, or add -Force to let the tool close it gracefully."
+        exit 1
+    }
+    if ($script:GuiMode -and -not (Confirm-Box "OBS is running and needs to be closed, because SE.Live saves its canvas scenes when OBS shuts down.`n`nClose OBS gracefully now and reopen it when done?`n`n(If OBS shows a confirmation dialog on screen, answer it there.)")) {
+        exit 0
+    }
+    try { Close-Obs } catch { Show-ErrorBox $_.Exception.Message; exit 1 }
+    Wait-FilesSettled $compDir
+}
+
+if ($File) {
+    $percorsi = @(Get-Item -LiteralPath $File)
+} else {
+    $percorsi = @(Get-ChildItem -LiteralPath $compDir -Filter '*.json' -File -ErrorAction SilentlyContinue)
+    if ($percorsi.Count -eq 0 -and $script:GuiMode -and
+        (Confirm-Box "No SE.Live composition files found in:`n$compDir`n`nIs SE.Live installed and have you created at least one canvas?`n`nBrowse for a composition file manually (e.g. portable OBS)?")) {
+        $dlg = New-Object System.Windows.Forms.OpenFileDialog
+        $dlg.Filter = 'SE.Live composition (*.json)|*.json'
+        $dlg.Title  = 'Pick an SE.Live composition file (...\streamelements_multi-streaming\compositions\*.json)'
+        if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $percorsi = @(Get-Item -LiteralPath $dlg.FileName) }
+    }
+    if ($percorsi.Count -eq 0) {
+        Show-ErrorBox "No composition files found in:`n$compDir`n`nIs SE.Live installed, and have you created at least one canvas?"
+        exit 1
+    }
+}
+
+$canvasList = Get-Canvases $percorsi
+if ($canvasList.Count -eq 0) {
+    Show-ErrorBox "Found some files, but none contain scenes in a recognizable format. If SE.Live changed its file format, this tool may need an update."
+    exit 1
+}
+$seVersion = Get-SELiveVersion $canvasList[0].Path
+
+# ------------------------------------------------------------------ #
+#  6a. Command-line mode                                             #
+# ------------------------------------------------------------------ #
+if ($List) {
+    if ((Get-ObsProcess).Count -gt 0) { Write-Host "(OBS is running: unsaved dock changes are not in the files yet)" -ForegroundColor Yellow }
+    if ($seVersion) { Write-Host "SE.Live core $seVersion (tool tested with $($script:TestedSELive))" }
+    foreach ($c in $canvasList) {
+        Write-Host ""
+        Write-Host "Canvas '$($c.Name)'  ->  $($c.Path)" -ForegroundColor Cyan
+        if ($c.FormatIssue) { Write-Host "  unsupported format: $($c.FormatIssue)" -ForegroundColor Red }
+        foreach ($s in (Get-SceneList $c.Dati)) {
+            $mark = if ($s.active) { '*' } else { ' ' }
+            Write-Host ("  {0} {1}  ({2} sources)" -f $mark, $s.name, @(@($s.sources) | Where-Object { $null -ne $_ }).Count)
+        }
+        Write-Host ("  backups: {0}" -f (Get-Backups $c).Count)
+    }
+    exit 0
+}
+
 if (-not $script:GuiMode) {
-    if (-not $Scene -or -not $NewName) {
-        Show-ErrorBox "In -NoGui mode you must pass -Scene and -NewName."
-        exit 1
-    }
-    if ($canvasList.Count -gt 1 -and -not $File) {
+    $target = $canvasList[0]
+    if ($Canvas) {
+        $target = @($canvasList | Where-Object { $_.Name -eq $Canvas }) | Select-Object -First 1
+        if (-not $target) { Show-ErrorBox ("Canvas '$Canvas' not found. Canvases: " + (($canvasList | ForEach-Object { $_.Name }) -join ', ')); exit 1 }
+    } elseif ($canvasList.Count -gt 1) {
         $list2 = ($canvasList | ForEach-Object { "$($_.Name) -> $($_.Path)" }) -join "`n"
-        Show-ErrorBox "More than one canvas found, pick one with -File:`n$list2"
+        Show-ErrorBox "More than one canvas found, pick one with -Canvas <name> or -File <path>:`n$list2"
         exit 1
     }
+    $names = Split-Names $NewName
     try {
-        if ($Rename) { $res = Invoke-SceneRename    -Canvas $canvasList[0] -SceneName $Scene -TargetName $NewName }
-        else         { $res = Invoke-SceneDuplicate -Canvas $canvasList[0] -SceneName $Scene -TargetName $NewName }
+        if ($RestoreFrom) {
+            $res = Invoke-BackupRestore -Canvas $target -BackupPath $RestoreFrom
+            $msg = "Done! Canvas '$($target.Name)' restored ($($res.Scenes.Count) scenes: $($res.Scenes -join ', '))."
+        } elseif ($Delete) {
+            if (-not $Scene) { throw "-Delete needs -Scene." }
+            $res = Invoke-SceneDelete -Canvas $target -SceneName $Scene
+            $msg = "Done! Scene '$Scene' deleted."
+        } else {
+            if (-not $Scene -or $names.Count -eq 0) { throw "In -NoGui mode you must pass -Scene and -NewName (or -Delete, -RestoreFrom, -List)." }
+            if ($Rename) {
+                if ($names.Count -ne 1) { throw "-Rename takes exactly one new name." }
+                $res = Invoke-SceneRename -Canvas $target -SceneName $Scene -TargetName $names[0]
+                $msg = "Done! Scene '$Scene' renamed to '$($names[0])'.$($res.Note)"
+            } else {
+                $res = Invoke-SceneDuplicate -Canvas $target -SceneName $Scene -TargetNames $names -AfterOriginal (-not $AtEnd)
+                $msg = "Done! Scene '$Scene' duplicated as: $($names -join ', ')."
+            }
+        }
     } catch {
         Show-ErrorBox $_.Exception.Message
         exit 1
     }
     Write-Host ""
-    if ($Rename) { Write-Host "Done! Scene '$Scene' renamed to '$NewName'." -ForegroundColor Green }
-    else         { Write-Host "Done! Scene '$Scene' duplicated as '$NewName'." -ForegroundColor Green }
-    Write-Host "Backup: $($res.Backup)"
+    Write-Host $msg -ForegroundColor Green
+    Write-Host "Backup of the previous state: $($res.Backup)"
     $warn = Format-Warnings $res.Warnings
     if ($warn) { Write-Host $warn -ForegroundColor Yellow }
     if (-not $NoRestart -and $script:ObsExe) { [void](Start-Obs) }
@@ -437,142 +811,184 @@ if (-not $script:GuiMode) {
 }
 
 # ------------------------------------------------------------------ #
-#  4b. GUI mode                                                      #
+#  6b. GUI mode                                                      #
 # ------------------------------------------------------------------ #
 $form                 = New-Object System.Windows.Forms.Form
-$form.Text            = 'SE.Live Scene Tool - Duplicate / Rename (v2 surgical)'
-$form.Size            = New-Object System.Drawing.Size(460, 345)
+$form.Text            = "SE.Live Scene Tool v$($script:ToolVersion)"
+$form.ClientSize      = New-Object System.Drawing.Size(460, 400)
 $form.StartPosition   = 'CenterScreen'
 $form.FormBorderStyle = 'FixedDialog'
 $form.MaximizeBox     = $false
 $form.MinimizeBox     = $false
+$form.Font            = New-Object System.Drawing.Font('Segoe UI', 9)
 
-$y = 15
+function New-Control([string]$Type, [int]$X, [int]$Y, [int]$W, [int]$H, [string]$Text) {
+    $c = New-Object "System.Windows.Forms.$Type"
+    $c.Location = New-Object System.Drawing.Point($X, $Y)
+    $c.Size     = New-Object System.Drawing.Size($W, $H)
+    if ($Text) { $c.Text = $Text }
+    $form.Controls.Add($c)
+    return $c
+}
 
-$rdoDuplicate          = New-Object System.Windows.Forms.RadioButton
-$rdoDuplicate.Text     = 'Duplicate'
-$rdoDuplicate.Checked  = $true
-$rdoDuplicate.Location = New-Object System.Drawing.Point(15, $y)
-$rdoDuplicate.Size     = New-Object System.Drawing.Size(110, 22)
-$form.Controls.Add($rdoDuplicate)
+$rdoDuplicate = New-Control RadioButton 15  12 90 22 'Duplicate'
+$rdoRename    = New-Control RadioButton 110 12 80 22 'Rename'
+$rdoDelete    = New-Control RadioButton 195 12 75 22 'Delete'
+$rdoRestore   = New-Control RadioButton 275 12 140 22 'Restore backup'
+$rdoDuplicate.Checked = $true
 
-$rdoRename          = New-Object System.Windows.Forms.RadioButton
-$rdoRename.Text     = 'Rename'
-$rdoRename.Location = New-Object System.Drawing.Point(140, $y)
-$rdoRename.Size     = New-Object System.Drawing.Size(120, 22)
-$form.Controls.Add($rdoRename)
-$y += 30
+$lblCanvas = New-Control Label    15 44  430 18 'Canvas:'
+$cmbCanvas = New-Control ComboBox 15 63  430 24 $null
+$lblScene  = New-Control Label    15 97  430 18 'Scene to copy:'
+$cmbScene  = New-Control ComboBox 15 116 430 24 $null
+$lblName   = New-Control Label    15 150 430 18 'Name(s) of the copy - one per line for several copies:'
+$txtName   = New-Control TextBox  15 169 430 66 $null
+$lblHint   = New-Control Label    15 240 430 54 ''
+$chkAfter   = New-Control CheckBox 15 300 430 22 'Place the copies right after the original (otherwise at the end)'
+$chkRestart = New-Control CheckBox 15 326 430 22 'Reopen OBS when done'
+$lblVersion = New-Control Label   15 367 220 18 ''
+$btnOk      = New-Control Button  255 360 92 28 'Duplicate'
+$btnCancel  = New-Control Button  353 360 92 28 'Cancel'
 
-$lblCanvas          = New-Object System.Windows.Forms.Label
-$lblCanvas.Text     = 'Canvas:'
-$lblCanvas.Location = New-Object System.Drawing.Point(15, $y)
-$lblCanvas.Size     = New-Object System.Drawing.Size(415, 18)
-$form.Controls.Add($lblCanvas)
-$y += 20
-
-$cmbCanvas               = New-Object System.Windows.Forms.ComboBox
-$cmbCanvas.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
-$cmbCanvas.Location      = New-Object System.Drawing.Point(15, $y)
-$cmbCanvas.Size          = New-Object System.Drawing.Size(415, 24)
-foreach ($c in $canvasList) { [void]$cmbCanvas.Items.Add($c.Name) }
-$cmbCanvas.SelectedIndex = 0
-$form.Controls.Add($cmbCanvas)
-$y += 34
-
-$lblScene          = New-Object System.Windows.Forms.Label
-$lblScene.Text     = 'Scene:'
-$lblScene.Location = New-Object System.Drawing.Point(15, $y)
-$lblScene.Size     = New-Object System.Drawing.Size(415, 18)
-$form.Controls.Add($lblScene)
-$y += 20
-
-$cmbScene               = New-Object System.Windows.Forms.ComboBox
-$cmbScene.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
-$cmbScene.Location      = New-Object System.Drawing.Point(15, $y)
-$cmbScene.Size          = New-Object System.Drawing.Size(415, 24)
-$form.Controls.Add($cmbScene)
-$y += 34
-
-$lblName          = New-Object System.Windows.Forms.Label
-$lblName.Text     = 'Name of the copy:'
-$lblName.Location = New-Object System.Drawing.Point(15, $y)
-$lblName.Size     = New-Object System.Drawing.Size(415, 18)
-$form.Controls.Add($lblName)
-$y += 20
-
-$txtName          = New-Object System.Windows.Forms.TextBox
-$txtName.Location = New-Object System.Drawing.Point(15, $y)
-$txtName.Size     = New-Object System.Drawing.Size(415, 24)
-$form.Controls.Add($txtName)
-$y += 34
-
-$chkRestart          = New-Object System.Windows.Forms.CheckBox
-$chkRestart.Text     = 'Reopen OBS when done'
-$chkRestart.Checked  = $true
-$chkRestart.Location = New-Object System.Drawing.Point(15, $y)
-$chkRestart.Size     = New-Object System.Drawing.Size(415, 22)
-$form.Controls.Add($chkRestart)
-$y += 32
-
-$btnOk          = New-Object System.Windows.Forms.Button
-$btnOk.Text     = 'Duplicate'
-$btnOk.Location = New-Object System.Drawing.Point(240, $y)
-$btnOk.Size     = New-Object System.Drawing.Size(90, 28)
-$form.Controls.Add($btnOk)
-
-$btnCancel          = New-Object System.Windows.Forms.Button
-$btnCancel.Text     = 'Cancel'
-$btnCancel.Location = New-Object System.Drawing.Point(340, $y)
-$btnCancel.Size     = New-Object System.Drawing.Size(90, 28)
+foreach ($cmb in @($cmbCanvas, $cmbScene)) { $cmb.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList }
+$txtName.Multiline     = $true
+$txtName.AcceptsReturn = $true
+$txtName.ScrollBars    = 'Vertical'
+$lblHint.ForeColor     = [System.Drawing.Color]::DimGray
+$lblVersion.ForeColor  = [System.Drawing.Color]::Gray
+$chkRestart.Checked    = $true
+$chkAfter.Checked      = $true
 $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
-$form.Controls.Add($btnCancel)
-
-$form.AcceptButton = $btnOk
 $form.CancelButton = $btnCancel
 
+$verText = "v$($script:ToolVersion)"
+if ($seVersion) {
+    $verText += " - SE.Live $seVersion"
+    if ($seVersion -ne $script:TestedSELive) { $verText += ' (untested)' }
+}
+$lblVersion.Text = $verText
+foreach ($c in $canvasList) { [void]$cmbCanvas.Items.Add($c.Name) }
+
 $script:LastDefault = ''
-$UpdateName = {
-    if ($cmbScene.SelectedItem) {
-        if ($rdoRename.Checked) { $default = [string]$cmbScene.SelectedItem }
-        else                      { $default = "$($cmbScene.SelectedItem) - Copy" }
-        if ($txtName.Text -eq $script:LastDefault -or [string]::IsNullOrWhiteSpace($txtName.Text)) {
-            $txtName.Text = $default
+$script:Backups     = @()
+
+function Get-CurrentCanvas { return $canvasList[$cmbCanvas.SelectedIndex] }
+
+$UpdateHint = {
+    $canvas = Get-CurrentCanvas
+    $lblHint.ForeColor = [System.Drawing.Color]::DimGray
+    $btnOk.Enabled = $true
+    if ($rdoRestore.Checked) {
+        if ($script:Backups.Count -eq 0) {
+            $lblHint.Text = 'No backups yet for this canvas: the tool creates one before every change.'
+            $btnOk.Enabled = $false
+        } elseif ($cmbScene.SelectedIndex -ge 0) {
+            $b = $script:Backups[$cmbScene.SelectedIndex]
+            if ($null -eq $b.Scenes) { $lblHint.Text = 'This backup cannot be read.'; $btnOk.Enabled = $false }
+            else { $lblHint.Text = "Scenes in this backup: $($b.Scenes -join ', ')`nThe current state is backed up too before restoring." }
         }
-        $script:LastDefault = $default
+    } elseif ($rdoRename.Checked) {
+        if ($cmbScene.SelectedIndex -eq 0) {
+            $lblHint.Text = "This is the first scene of the canvas: SE.Live decides its name by itself and ignores a rename made here. Rename it from the SE.Live dock instead."
+        } else {
+            $lblHint.Text = "Renaming a scene SE.Live already knows may be reverted by SE.Live. If you just need the right name, duplicate with the new name instead."
+        }
+        $lblHint.ForeColor = [System.Drawing.Color]::DarkOrange
+    } elseif ($rdoDelete.Checked) {
+        $scene = @(Get-SceneList $canvas.Dati)[[Math]::Max(0, $cmbScene.SelectedIndex)]
+        if ($scene -and $scene.active) {
+            $lblHint.Text = "This is the active scene of the canvas: switch the canvas to another scene in OBS first, then delete it."
+            $btnOk.Enabled = $false
+        } else {
+            $lblHint.Text = "The scene is removed from the canvas (its sources stay in OBS). A backup is made first, so you can bring it back with Restore backup."
+        }
+        $lblHint.ForeColor = [System.Drawing.Color]::DarkOrange
+    } else {
+        $lblHint.Text = "Use brand-new names never used before on this canvas. The copy gets the same sources, positions, crops and filters."
+    }
+    if ($canvas.FormatIssue) {
+        $lblHint.Text = "Unsupported file format ($($canvas.FormatIssue)). SE.Live probably changed something: the tool needs an update."
+        $lblHint.ForeColor = [System.Drawing.Color]::Firebrick
+        $btnOk.Enabled = $false
     }
 }
-$UpdateScenes = {
+$UpdateName = {
+    if ($rdoRestore.Checked -or $rdoDelete.Checked -or -not $cmbScene.SelectedItem) { return }
+    if ($rdoRename.Checked) { $default = [string]$cmbScene.SelectedItem }
+    else                    { $default = "$($cmbScene.SelectedItem) - Copy" }
+    if ($txtName.Text -eq $script:LastDefault -or [string]::IsNullOrWhiteSpace($txtName.Text)) {
+        $txtName.Text = $default
+    }
+    $script:LastDefault = $default
+}
+$UpdateList = {
     $cmbScene.Items.Clear()
-    $canvas = $canvasList[$cmbCanvas.SelectedIndex]
-    foreach ($s in $canvas.Dati.scenes) { [void]$cmbScene.Items.Add([string]$s.name) }
+    $canvas = Get-CurrentCanvas
+    if ($rdoRestore.Checked) {
+        $script:Backups = Get-Backups $canvas
+        foreach ($b in $script:Backups) { [void]$cmbScene.Items.Add((Format-Backup $b)) }
+    } else {
+        foreach ($s in (Get-SceneList $canvas.Dati)) { [void]$cmbScene.Items.Add([string]$s.name) }
+    }
     if ($cmbScene.Items.Count -gt 0) { $cmbScene.SelectedIndex = 0 }
+    & $UpdateName
+    & $UpdateHint
 }
 $UpdateMode = {
-    if ($rdoRename.Checked) { $lblName.Text = 'New name:';         $btnOk.Text = 'Rename'    }
-    else                      { $lblName.Text = 'Name of the copy:'; $btnOk.Text = 'Duplicate' }
-    & $UpdateName
+    if ($rdoRestore.Checked) {
+        $lblScene.Text = 'Backup to restore (newest first):'; $btnOk.Text = 'Restore'
+    } elseif ($rdoRename.Checked) {
+        $lblScene.Text = 'Scene to rename:'; $lblName.Text = 'New name:'; $btnOk.Text = 'Rename'
+    } elseif ($rdoDelete.Checked) {
+        $lblScene.Text = 'Scene to delete:'; $btnOk.Text = 'Delete'
+    } else {
+        $lblScene.Text = 'Scene to copy:'; $lblName.Text = 'Name(s) of the copy - one per line for several copies:'; $btnOk.Text = 'Duplicate'
+    }
+    $noName = $rdoRestore.Checked -or $rdoDelete.Checked
+    $lblName.Visible  = -not $noName
+    $txtName.Visible  = -not $noName
+    $chkAfter.Visible = $rdoDuplicate.Checked
+    $lblHint.Top      = if ($noName) { 150 } else { 240 }
+    & $UpdateList
 }
-$cmbCanvas.Add_SelectedIndexChanged($UpdateScenes)
-$cmbScene.Add_SelectedIndexChanged($UpdateName)
-$rdoDuplicate.Add_CheckedChanged($UpdateMode)
-& $UpdateScenes
-& $UpdateName
+$cmbCanvas.Add_SelectedIndexChanged($UpdateList)
+$cmbScene.Add_SelectedIndexChanged({ & $UpdateName; & $UpdateHint })
+$rdoDuplicate.Add_CheckedChanged({ if ($this.Checked) { & $UpdateMode } })
+$rdoRename.Add_CheckedChanged({ if ($this.Checked) { & $UpdateMode } })
+$rdoDelete.Add_CheckedChanged({ if ($this.Checked) { & $UpdateMode } })
+$rdoRestore.Add_CheckedChanged({ if ($this.Checked) { & $UpdateMode } })
+$cmbCanvas.SelectedIndex = 0
+& $UpdateMode
 
 $btnOk.Add_Click({
     try {
-        $canvas   = $canvasList[$cmbCanvas.SelectedIndex]
-        $selected = [string]$cmbScene.SelectedItem
-        $target   = $txtName.Text.Trim()
-        if ($rdoRename.Checked) {
-            $res = Invoke-SceneRename -Canvas $canvas -SceneName $selected -TargetName $target
-            $msg = "Done! Scene '$selected' renamed to '$target'.`n`nBackup of the original:`n$($res.Backup)"
+        $canvas = Get-CurrentCanvas
+        if ($rdoRestore.Checked) {
+            $b = $script:Backups[$cmbScene.SelectedIndex]
+            if (-not (Confirm-Box "Restore canvas '$($canvas.Name)' to the backup of $('{0:yyyy-MM-dd HH:mm:ss}' -f $b.When)?`n`nScenes after restore: $($b.Scenes -join ', ')")) { return }
+            $res = Invoke-BackupRestore -Canvas $canvas -BackupPath $b.Path
+            $msg = "Done! Canvas restored ($($res.Scenes.Count) scenes).`n`nBackup of the state before restoring:`n$($res.Backup)"
+        } elseif ($rdoDelete.Checked) {
+            $selected = [string]$cmbScene.SelectedItem
+            if (-not (Confirm-Box "Delete scene '$selected' from canvas '$($canvas.Name)'?`n`nA backup is made first.")) { return }
+            $res = Invoke-SceneDelete -Canvas $canvas -SceneName $selected
+            $msg = "Done! Scene '$selected' deleted.`n`nBackup of the previous state:`n$($res.Backup)"
         } else {
-            $res = Invoke-SceneDuplicate -Canvas $canvas -SceneName $selected -TargetName $target
-            $msg = "Done! Scene duplicated as '$target'.`n`nBackup of the original:`n$($res.Backup)"
+            $selected = [string]$cmbScene.SelectedItem
+            $names    = Split-Names @($txtName.Text)
+            if ($rdoRename.Checked) {
+                if ($names.Count -ne 1) { throw "Type exactly one new name." }
+                $res = Invoke-SceneRename -Canvas $canvas -SceneName $selected -TargetName $names[0]
+                $msg = "Done! Scene '$selected' renamed to '$($names[0])'.`n`nBackup of the original:`n$($res.Backup)$($res.Note)"
+            } else {
+                $res = Invoke-SceneDuplicate -Canvas $canvas -SceneName $selected -TargetNames $names -AfterOriginal $chkAfter.Checked
+                $what = if ($names.Count -eq 1) { "as '$($names[0])'" } else { "$($names.Count) times: $($names -join ', ')" }
+                $msg = "Done! Scene '$selected' duplicated $what.`n`nBackup of the original:`n$($res.Backup)"
+            }
+            $msg += Format-Warnings $res.Warnings
         }
-        $msg += Format-Warnings $res.Warnings
         if ($chkRestart.Checked) {
-            if (Start-Obs) { $msg += "`n`nReopening OBS: check the vertical canvas dock." }
+            if (Start-Obs) { $msg += "`n`nReopening OBS: check the canvas dock." }
             else           { $msg += "`n`nCould not find the OBS executable: please reopen it manually." }
         }
         Show-InfoBox $msg
